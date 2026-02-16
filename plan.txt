@@ -1,0 +1,278 @@
+一、多实例学习（MIL）在深度学习里的定位：它在解决什么问题
+MIL（Multi-Instance Learning）的核心动机是：监督信号（标签）只在“包/集合（bag）”层级可得，但输入天然是“多个实例（instances）组成的集合”。典型例子是：整张病理切片（bag）只有一个诊断标签，但切片里有成千上万个patch（instances），而且你并不知道哪些patch真正决定诊断。
+
+你的任务（sEMG→临床量表评分）本质上也是这种结构：最小标注单位是 session (s,t)，但 session 内部包含多个 axis、多个 trial、每个 trial 又包含大量滑窗 window。标签在 session 层级，模型却需要从大量 window 中“汇总出”一个稳定的 session 级预测。
+
+二、MIL为什么能解决这类问题（直觉与可解释性）
+1）“集合不变性”要求。bag 的 label 与实例顺序无关（你把 windows 打乱顺序，session 的 FMA 不会变）。MIL模型在结构上就满足 permutation-invariant（通常通过 pooling / attention pooling）。
+2）“部分实例决定整体”或“多实例共同决定整体”。两种常见假设：
+
+* 经典 MIL 假设（weakly-supervised detection风格）：bag 为阳性是因为至少有一个关键实例为阳性。
+* 更一般的回归/表征假设：bag 的标签由多个实例的统计特征决定（平均水平、峰值、协同模式、时序结构等）。你的临床评分更符合第二种：并不是某一个 window “决定”FMA，而是大量动作片段的肌群协同、用力幅度、稳定性与控制能力共同决定。
+  3）注意力MIL（Attention MIL）给了“软选择”。attention 权重让模型学到哪些 windows/trials 更有贡献，从而在小样本下比硬 pooling 更稳，还能做一定程度的解释（哪些窗/试次最关键）。
+
+三、深度MIL的基本原理（从 set pooling 到 attention pooling）
+把一个 bag 表示为 (B={x_i}*{i=1}^n)。深度MIL一般分两段：
+1）实例编码器 (h_i=f*\theta(x_i))，把每个 window 编码成向量；
+2）聚合器 (z = \mathrm{Agg}({h_i}))，再接预测头 (y=\mathrm{Head}(z))。
+
+聚合器从弱到强大致是：
+
+* Mean/Max pooling：稳定但表达能力有限；
+* Attention pooling：(\alpha_i=\mathrm{softmax}(g(h_i)))，(z=\sum_i \alpha_i h_i)。
+* Gated-Attention（更强）：用 (\tanh(W_v h_i)\odot \sigma(W_u h_i)) 再打分，更稳更常用；
+* Set Transformer / Transformer MIL：把 instances 当 token 做自注意力，表达力更强但小样本更易过拟合（除非表征很强且正则到位）。
+
+四、层级MIL（Hierarchical MIL）为什么是你的最佳结构
+你的层级是：window ⟶ trial ⟶ axis ⟶ session。把所有 windows 扁平化成一个大 bag 当然也能做，但会有两个问题：
+
+* 结构信息损失：trial 内相关性、axis 内相关性被忽略；
+* 训练不稳：bag 内实例数太大，attention 变得噪声很大，小样本下更容易“记人”。
+
+层级MIL的做法是分层聚合：
+1）window→trial：在每个 trial 内做 attention pooling 得到 trial embedding；
+2）trial→axis：在同一 axis 的多个 trial 上再做 attention pooling 得到 axis embedding；
+3）axis→session：拼接(y,z)两轴 embedding，再做一个小MLP输出 session 的评分。
+这种结构把“同一试次/同一轴”的稳定统计先压缩掉，显著提升小样本稳定性。
+
+五、MIL的发展脉络（你需要知道的关键点）
+
+* 早期：MI-SVM、DD（Diverse Density）等，依赖手工特征；
+* 深度MIL：CNN/RNN/Transformer 做 instance encoder + pooling；
+* Attention MIL（含 gated attention）成为主流，兼顾性能与解释；
+* 近年：Transformer-based MIL、图MIL（节点为实例/通道）、多尺度/层级MIL、以及“先表征、后MIL”的两阶段范式（小样本里尤其重要）。
+
+六、MIL在不同场景中的典型应用（映射到你的问题）
+
+* 医学影像（WSI）：bag=slide，instance=patch；
+* 视频理解：bag=video，instance=clip；
+* 音频/语音：bag=utterance，instance=frame/window；
+* 传感器与可穿戴：bag=session，instance=windows（与你完全同构）；
+* 临床纵向数据：bag=subject or visit-set，instance=visits/windows（可扩展到你未来的subject纵向建模）。
+
+七、小样本MIL的真实瓶颈与最有效提升手段
+你自己已经点到关键：16人（或近似量级）下，最常见瓶颈不是聚合器，而是 window encoder 表征弱 + 过度记住 subject。小样本MIL里公认最有效的组合是：
+1）在每个外层fold内，用训练subjects做自监督预训练 window encoder（避免泄漏）；
+2）监督阶段用强正则（EMA teacher / consistency / instance dropout / bounded head / 合理损失尺度归一）；
+3）评估时降低随机性（val/test 固定采样策略、EMA权重评估）。
+
+下面把你的数据集信息纳入，并给出一套“可直接落地”的完整方案与代码（zip）。
+
+---
+
+八、你的数据集：从你给的 CSV 解析到的结构化事实（用于完善方案）
+你上传的两个文件里能读到以下关键信息（我按“训练可用性”的角度总结）：
+
+1）临床评分（ensembledInfo.csv）
+
+* 表格是三层表头：TimeAxis（pre/post/3mf）× Scale（FMA/MAS/ARAT/WMFT/FIM…）× Subscore。
+* FMA 在 pre/post/3mf 三个阶段都有：UE、S/E、W/H。你主任务就是 W/H（0..24）和 S/E（0..42），可派生 UE=WH+SE（0..66）用于一致性约束。
+* MAS、ARAT、WMFT、FIM 也都有（在这份表里没有缺失），其中 FIM 明显接近天花板（对回归不友好，适合作为辅助分析而非主优化目标）。
+
+2）原始EMG文件清单（dataInfo.csv）
+
+* TimeAxis 取值为 pre / post / 3MFU（即你说的 3mf）。
+* 每个 (SubjectName, TimeAxis) 恰好 6 个文件：HorizontalTask1-3 与 VerticalTask1-3。也就是：2轴 × 3 trials/轴，与你的层级定义一致。
+* 形状字段显示每条序列是变长，且列数为 7（形如 (T,7)）。这很重要：说明 raw 文件里不止 4路 sEMG，可能还含 time 或其他通道。训练前必须明确 “哪4列是EMG”。我在代码里把它做成可配置的 emg_cols（默认遇到 7列时取 [1,2,3,4]，即跳过第0列 time）。
+
+3）两份表存在“subject名单不完全一致”的情况
+
+* dataInfo.csv 里出现的 subject name 数量 > ensembledInfo.csv。意味着：可能有部分 raw 没有对应评分，或名单映射还没整理完。
+* 我在数据准备脚本里提供了 `--drop_unmatched_subjects` 选项：若开启，则只保留能在评分表里匹配到的受试者，避免无标签 session 混入监督训练。监督用的 SessionBagDataset 也默认要求 FMA_WH 与 FMA_SE 都存在才纳入。
+
+这三点直接决定了“最佳实践”的数据准备与训练设计：必须（a）可配置抽取4路EMG，（b）固定 trial/axis 层级，（c）严格筛掉无标签 session，避免训练目标被稀释。
+
+---
+
+九、完整项目方案（结构化陈述：背景-科学问题-数据集-方法）
+
+1）背景
+目标是将每次临床评估会话 session(s,t) 对应的多trial、多axis、变长sEMG，映射到上肢运动功能评分（FMA_WH 0–24、FMA_SE 0–42），并在 Subject-level LOSO 协议下实现尽可能小的绝对分数误差（MAE）。
+
+2）科学问题（本质挑战）
+
+* 标签层级与数据层级不匹配：标签在 session，但数据在 window/trial/axis；
+* 变长序列与不同运动片段的异质性：每个 trial 的动作质量、稳定性、完成度不同；
+* 小样本 + 强个体差异：模型容易学到 subject signature（“记人”）而非功能相关表征；
+* 纵向阶段（pre/post/3mf）引入 domain shift：肌力/控制变化导致分布漂移。
+
+3）数据集结构（用于建模的标准化定义）
+
+* Subject：N≈16（当前评分表可见为15；代码可处理不等N）
+* Stage：pre/post/3mf（raw里叫3MFU）
+* Session：(s,t) 为最小标签单位
+* Axis：y/z（由 HorizontalTask / VerticalTask 映射）
+* Trial：每轴 3 次重复
+* Sequence：变长，raw列数=7（需选择4列为EMG）
+* Window：滑窗切分，固定 Tw、Ts，窗口内做通道归一化
+
+4）方法（具体方案，端到端可复现）
+
+4.1 数据准备（强烈建议一次性转换成 .npy）
+
+* 从 dataInfo.csv 构建 manifest.csv：每行对应一个 trial 文件，字段包含 subject_id, stage, session_id, axis(y/z), trial_id, path。
+* 从 ensembledInfo.csv 构建 labels.csv：每行对应一个 session，字段包含 session_id, subject_id, stage, FMA_WH, FMA_SE（及可选辅助量表）。
+* raw .lvm → npy：读取 (T,7)，用 emg_cols 抽取 4 路EMG并转置成 (C,T)，保存成 npy。
+  理由：
+  (1) 避免每个epoch重复解析 .lvm（慢且易受格式差异影响）；
+  (2) 把“抽取哪4列是EMG”固化到一次性准备步骤，保证可复现；
+  (3) 训练时 I/O 更稳定。
+
+4.2 表征学习优先：fold-wise 自监督预训练 window encoder（MoCo）
+
+* 外层fold内，仅用训练 subjects 的所有 windows 做 MoCo 对比学习：同一 window 的两种增强为正对，不同 windows 为负对；用队列存大量负样本，适合小batch/小数据。
+* encoder 备选：1D-TCN、Transformer、iTransformer（通道token）、GCN（通道图）、Mamba（可选，需额外依赖）。
+  理由：
+  (1) 小样本监督下 encoder 最易塌陷为“记人”；SSL 强迫 encoder 学到跨 trial/跨 session 更通用的动态模式；
+  (2) MoCo 对 batch size 不敏感（有 queue），更适合你这种 N 小但 window 数可观的场景；
+  (3) fold-wise 预训练杜绝泄漏：test subject 的任何 window 都不参与 encoder 学习。
+
+4.3 监督阶段：层级MIL回归（window→trial→axis→session）+ 有界输出
+
+* window encoder 输出 d维嵌入；
+* trial 内 gated-attention 聚合 K 个 window；
+* axis 内 gated-attention 聚合 R 个 trial；
+* 拼接 y/z 两轴 embedding → MLP 融合 → 两个回归头输出 WH 与 SE；
+* 输出层使用 sigmoid 映射到合法范围：
+  WH = 24·sigmoid(u_wh)，SE = 42·sigmoid(u_se)
+  理由：
+  (1) 有界输出对临床量表回归非常关键：它能显著减少离谱预测（这会拉高 MAE）；
+  (2) 层级聚合能降低 bag 内噪声、提升稳定性；
+  (3) gated attention 在小样本下比 transformer-pooling 更稳。
+
+4.4 损失函数：以“绝对误差小”为中心的尺度归一化 Huber
+
+* 主损失：Normalized Huber（对 WH 用 scale=24，对 SE 用 scale=42），让两个任务在梯度尺度上平衡；
+* UE 派生一致性（可选）：对 UE=WH+SE 再加一个小权重的 Huber，抑制两头输出不一致。
+  理由：Huber 比 MSE 对异常更稳，比 MAE 可导性更好；做 scale normalization 能直接提升“绝对分数误差”的优化效率。
+
+4.5 监督阶段一致性正则：Mean-Teacher with EMA（已加入代码）
+做法（标准 Mean-Teacher）：
+
+* Student：正常反传更新；
+* Teacher：Student 参数的 EMA（指数滑动平均）副本，不参与梯度；
+* 同一个 session bag 生成两个随机视图（不同 trial/window 采样 + 弱增强）：student 看 view1，teacher 看 view2；
+* 一致性损失：对归一化预测 ([WH/24, SE/42]) 做 MSE 或 SmoothL1；
+* 一致性权重做 ramp-up（前若干 epoch 逐渐增大），避免早期 teacher 不稳带来错误约束。
+  理由：
+  (1) 你的 MIL 训练天然存在采样噪声（从变长序列里抽 windows），一致性正则能显著降低方差；
+  (2) EMA teacher 在小数据上普遍比“同模型双视图”更稳（teacher 更平滑）；
+  (3) 本质是在鼓励模型学到对采样/轻微增强不敏感的 session-level function mapping，从而更接近“临床评分应稳定”的先验。
+
+4.6 防“记人”的关键工程细节（我也写进代码了）
+
+* val/test 采用确定性采样（固定挑选窗口起点、固定 trial 顺序），减少评估抖动；
+* 训练时对 window_mask / trial_mask 做 instance dropout（随机丢部分 windows/trials，但保证不全丢），逼迫模型分散注意力，降低对某几个固定片段的依赖；
+* teacher 用 eval 模式（关闭 dropout），student 用 train 模式；
+* LOSO 内层验证也按 subject 划分，严格避免泄漏。
+
+---
+
+十、可复现的超参搜索空间（与你的目标一致：MAE最小且稳定）
+我在 `src/grid_search.py` 里给了一个“可直接跑”的随机搜索空间（避免组合爆炸），核心范围如下（你也可以固定部分参数缩小搜索）：
+
+1）窗口与层级
+
+* Tw_samples ∈ {256, 384, 512, 640}
+* Ts_samples ∈ {Tw/2, Tw/4}
+* windows_per_trial K ∈ {8, 16, 32}
+* trials_per_axis R ∈ {3, 4, 6}（你数据里通常=3，搜索主要为抗缺失/鲁棒）
+
+2）encoder 类型与规模
+
+* encoder_type ∈ {tcn, itransformer, transformer, gcn}（mamba在代码里可选）
+* emb_dim ∈ {64, 128, 256}
+* dropout ∈ {0.05, 0.1, 0.2, 0.3}
+* TCN：width ∈ {32,64,96}，blocks ∈ {3,5,7}，kernel ∈ {3,5,7}，stem_stride ∈ {1,2}
+* Transformer/iTransformer：layers ∈ {2,4,6}，heads ∈ {2,4,8}，ffn_ratio ∈ {2,4}，patch_size ∈ {4,8,16}
+* GCN：gcn_layers ∈ {1,2,3}，learn_adj ∈ {False, True}
+
+3）优化与正则
+
+* lr_head ∈ {3e-4, 1e-4, 3e-5}
+* lr_encoder_scale ∈ {0.1, 0.3, 1.0}（小样本通常 <1 更稳）
+* weight_decay ∈ {1e-4, 1e-3, 1e-2}
+* instance dropout：window_dropout_p ∈ {0,0.1,0.2,0.3}；trial_dropout_p ∈ {0,0.05,0.1,0.15}
+* Huber delta ∈ {0.02, 0.04, 0.08}
+* UE一致性 lambda_ue ∈ {0, 0.05, 0.1, 0.2}
+
+4）Mean-Teacher
+
+* consistency_weight ∈ {0, 0.05, 0.1, 0.2, 0.4}
+* rampup_epochs ∈ {0, 10, 20, 40}
+* consistency_loss_type ∈ {mse, smoothl1}
+
+---
+
+十一、自我review（方法与代码两层检查结论）
+
+1）方法层风险点与处理
+
+* 风险：LOSO 下 encoder 极易学 subject signature。
+  处理：fold-wise SSL + instance dropout + EMA teacher + bounded head + subject-level val。
+* 风险：MIL 的随机采样导致验证指标波动大。
+  处理：val/test 确定性采样；teacher（EMA）评估。
+* 风险：raw 7列里 EMG 列选择错误会直接毁掉结果。
+  处理：数据准备脚本把 emg_cols 显式参数化，并建议先 convert_to_npy 固化。
+* 风险：dataInfo 与 ensembledInfo subject 名单不一致导致无标签 session 混入。
+  处理：`--drop_unmatched_subjects` + SessionBagDataset 默认 require_both_main_labels=True。
+
+2）代码链路自检（我按“能跑且结构清晰”标准做了两轮）
+
+* 全部 .py 通过 `python -m py_compile`（语法与导入一致性 OK）。
+* 训练/评估的权重流：student 反传 → teacher EMA 更新 → val/test 用 teacher 权重（逻辑闭环）。
+* Mean-Teacher 实现采用“独立 teacher 模型 + EMA update”，避免每步 swap 权重的高开销（比最小实现更接近真实可用版本）。
+* 数据集返回张量形状固定，mask 明确；两视图采样在 Dataset 内完成，训练loop干净。
+
+---
+
+十二、项目代码（zip）与文件规划、训练流程清单
+
+下载：
+[Download the project zip](sandbox:/mnt/data/emg_mil_project.zip)
+
+主要文件结构（你要求的“子文件规划”都在，而且链路闭合）：
+
+* src/dataset.py：SessionBagDataset（层级MIL、两视图Mean-Teacher）、SSLWindowDataset
+* src/io_utils.py：.lvm 读取与 EMG 抽取、.npy/.pt 统一加载
+* src/baseModels.py：1D-TCN / Transformer / iTransformer / GCN / Mamba + HierarchicalMILRegressor
+* src/ssl_models.py：MoCo（含动量encoder与queue）
+* src/train_ssl.py：fold-wise SSL 预训练
+* src/train_mil.py：MIL监督训练 + EMA teacher + consistency 正则 + 评估
+* src/loss.py：NormalizedHuber + UE一致性 + ConsistencyLoss
+* src/grid_search.py：LOSO外层 + 内层subject-val + 随机超参搜索 + 测试评估
+* src/prepare_data.py：从 ensembledInfo.csv / dataInfo.csv 生成 manifest/labels，并可 convert_to_npy
+* README.md：使用说明
+
+训练流程清单（最短可复现路径）
+1）准备数据（强烈推荐转 npy）：
+
+```bash
+python -m src.prepare_data \
+  --ensembled_info_csv /path/to/ensembledInfo.csv \
+  --data_info_csv /path/to/dataInfo.csv \
+  --data_root /path/to/raw_root \
+  --out_dir /path/to/prepared \
+  --convert_to_npy \
+  --emg_cols 1,2,3,4 \
+  --time_col 0 \
+  --expected_emg_ch 4 \
+  --drop_unmatched_subjects
+```
+
+2）LOSO + 超参搜索（主结果协议）：
+
+```bash
+python -m src.grid_search \
+  --manifest_csv /path/to/prepared/manifest.csv \
+  --labels_csv /path/to/prepared/labels.csv \
+  --outdir experiments/run_001 \
+  --n_trials 20 \
+  --n_val_subjects 2 \
+  --seed 2026 \
+  --device cuda \
+  --ssl_epochs 100 \
+  --ssl_windows_per_epoch 20000
+```
+
+如果你接下来希望我进一步按你的真实数据目录结构（raw文件实际路径组织、lvm列名、采样率、滤波/包络等）把 `prepare_data.py` 的路径解析和预处理（带通、工频陷波、RMS/包络可选）做得更“即插即用”，你把一个真实 `.lvm` 的前 50 行（含header）和采样率告诉我即可；我会直接把读取与预处理逻辑补到工程里，并给出默认可用的 emg_cols/channel_names 配置。
