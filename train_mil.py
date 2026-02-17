@@ -86,7 +86,11 @@ def _safe_mean(total: float, count: int) -> float:
 
 def _save_loss_plot(history_df: pd.DataFrame, out_png: str) -> None:
     """
-    Plot total/supervised/consistency and WH/SE head losses in a single figure.
+    Plot MIL losses and validation metrics in one figure.
+    Rules:
+      - Same target group keeps same color family (WH/SE/UE).
+      - Different series in the same group use different line styles.
+      - Validation metrics are plotted with high transparency.
     """
     try:
         import matplotlib
@@ -100,18 +104,115 @@ def _save_loss_plot(history_df: pd.DataFrame, out_png: str) -> None:
     if len(history_df) == 0:
         return
 
-    fig, ax = plt.subplots(figsize=(8, 5))
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax_val = ax.twinx()
     x = history_df["epoch"].to_numpy()
-    ax.plot(x, history_df["train_loss_total"].to_numpy(), label="total", linewidth=2.0)
-    ax.plot(x, history_df["train_loss_sup"].to_numpy(), label="L_sup", linewidth=1.8, linestyle="--")
-    ax.plot(x, history_df["train_loss_cons"].to_numpy(), label="L_cons", linewidth=1.8, linestyle=":")
-    ax.plot(x, history_df["train_loss_wh"].to_numpy(), label="head_wh", linewidth=1.8)
-    ax.plot(x, history_df["train_loss_se"].to_numpy(), label="head_se", linewidth=1.8)
+
+    # Loss series (left axis)
+    if "train_loss_total" in history_df.columns:
+        ax.plot(
+            x,
+            history_df["train_loss_total"].to_numpy(),
+            label="loss_total",
+            linewidth=2.0,
+            color="black",
+            linestyle="-",
+            alpha=0.9,
+        )
+    if "train_loss_sup" in history_df.columns:
+        ax.plot(
+            x,
+            history_df["train_loss_sup"].to_numpy(),
+            label="loss_sup",
+            linewidth=1.8,
+            color="black",
+            linestyle="--",
+            alpha=0.9,
+        )
+    if "train_loss_cons" in history_df.columns:
+        ax.plot(
+            x,
+            history_df["train_loss_cons"].to_numpy(),
+            label="loss_cons",
+            linewidth=1.8,
+            color="black",
+            linestyle=":",
+            alpha=0.9,
+        )
+    if "train_loss_wh" in history_df.columns:
+        ax.plot(
+            x,
+            history_df["train_loss_wh"].to_numpy(),
+            label="loss_WH",
+            linewidth=1.8,
+            color="tab:blue",
+            linestyle="-",
+            alpha=0.9,
+        )
+    if "train_loss_se" in history_df.columns:
+        ax.plot(
+            x,
+            history_df["train_loss_se"].to_numpy(),
+            label="loss_SE",
+            linewidth=1.8,
+            color="tab:orange",
+            linestyle="-",
+            alpha=0.9,
+        )
+
+    # Validation metrics (right axis) with high transparency.
+    group_color = {
+        "WH": "tab:blue",
+        "SE": "tab:orange",
+        "UE": "tab:green",
+        "SCORE": "tab:gray",
+    }
+    series_style = {
+        "MAE": "--",
+        "RMSE": ":",
+        "R2": (0, (3, 1, 1, 1)),
+        "Corr": "-.",
+        "within1": (0, (1, 1)),
+        "within2": (0, (5, 2)),
+        "score": "-",
+    }
+
+    def _plot_val_metric(col: str, metric_name: str) -> None:
+        parts = metric_name.split("_")
+        if len(parts) >= 2 and parts[-1] in {"WH", "SE", "UE"}:
+            group = parts[-1]
+            series = "_".join(parts[:-1])
+        else:
+            group = "SCORE"
+            series = metric_name
+        color = group_color.get(group, "tab:gray")
+        linestyle = series_style.get(series, "--")
+        ax_val.plot(
+            x,
+            history_df[col].to_numpy(),
+            label=f"val_{metric_name}",
+            linewidth=1.4,
+            color=color,
+            linestyle=linestyle,
+            alpha=0.35,
+        )
+
+    for col in history_df.columns:
+        if col.startswith("val_"):
+            _plot_val_metric(col, col[4:])
+    if "val_score" in history_df.columns:
+        _plot_val_metric("val_score", "score")
+
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Loss")
-    ax.set_title("MIL Training Loss Curves")
+    ax_val.set_ylabel("Validation Metrics")
+    ax.set_title("MIL Loss + Validation Metrics")
     ax.grid(True, alpha=0.3)
-    ax.legend()
+
+    h1, l1 = ax.get_legend_handles_labels()
+    h2, l2 = ax_val.get_legend_handles_labels()
+    if len(h1) + len(h2) > 0:
+        ax.legend(h1 + h2, l1 + l2, loc="upper right", fontsize=8, ncol=2)
     fig.tight_layout()
     fig.savefig(out_png, dpi=150)
     plt.close(fig)
@@ -421,10 +522,12 @@ def train_mil_supervised(
             "train_cons_weight": _safe_mean(ep_wcons_sum, ep_steps),
             "train_loss_wh": _safe_mean(ep_wh_sum, ep_wh_steps),
             "train_loss_se": _safe_mean(ep_se_sum, ep_se_steps),
-            "val_score": float(val_score),
-            "val_MAE_WH": float(val_metrics.get("MAE_WH", float("nan"))),
-            "val_MAE_SE": float(val_metrics.get("MAE_SE", float("nan"))),
         }
+        for k, v in val_metrics.items():
+            if k == "val_score":
+                epoch_row["val_score"] = float(v)
+            else:
+                epoch_row[f"val_{k}"] = float(v)
         loss_history_rows.append(epoch_row)
         loss_df = pd.DataFrame(loss_history_rows)
         loss_df.to_csv(loss_csv_path, index=False)
@@ -439,6 +542,10 @@ def train_mil_supervised(
                 # Store plain dicts for cross-version safety.
                 "encoder_cfg": asdict(enc_cfg),
                 "mil_cfg": asdict(mil_cfg),
+                "split_info": {
+                    "train_subjects": [str(s) for s in train_subjects],
+                    "val_subjects": [str(s) for s in val_subjects],
+                },
                 "val_metrics": val_metrics,
                 "loss_history_csv": loss_csv_path,
                 "loss_history_plot": loss_png_path,

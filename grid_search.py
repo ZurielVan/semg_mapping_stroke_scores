@@ -269,11 +269,24 @@ def main():
             }
             fold_record["trials"].append(trial_rec)
 
+            # Fallback: keep the first successful trial checkpoint to avoid
+            # best_ckpt staying None when all val_score are inf.
+            if best_ckpt is None:
+                best_ckpt = mil_ckpt
+                best_hparams = hps
+                best_trial_dir = trial_dir
+
             if val_score < best_val:
                 best_val = val_score
                 best_ckpt = mil_ckpt
                 best_hparams = hps
                 best_trial_dir = trial_dir
+
+        if best_ckpt is None:
+            raise RuntimeError(
+                f"No valid trial checkpoint found in fold {fold_id} "
+                f"(test_subject={test_subject}). Check n_trials and training logs."
+            )
 
         # Evaluate best teacher model on test subject
         ckpt = torch_load_compat(best_ckpt, map_location="cpu")
@@ -307,6 +320,20 @@ def main():
         teacher.load_state_dict(ckpt["teacher"], strict=True)
 
         test_metrics = evaluate_mil(teacher, test_dl, device)
+
+        # Enrich best checkpoint with full split metadata for single-file traceability.
+        split_info = dict(ckpt.get("split_info", {}))
+        split_info.update(
+            {
+                "fold_id": fold_id,
+                "test_subject": str(test_subject),
+                "val_subjects": [str(s) for s in val_subjects],
+                "train_subjects": [str(s) for s in inner_train],
+            }
+        )
+        ckpt["split_info"] = split_info
+        ckpt["test_metrics"] = test_metrics
+        torch.save(ckpt, best_ckpt)
 
         fold_record["best"] = {
             "best_val": best_val,
