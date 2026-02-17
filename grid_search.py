@@ -29,7 +29,10 @@ def sample_hparams(rng: np.random.RandomState) -> Dict[str, Any]:
     dropout = float(rng.choice([0.05, 0.1, 0.2, 0.3]))
 
     Tw_samples = int(rng.choice([256, 384, 512, 640]))
-    Ts_samples = int(rng.choice([Tw_samples // 2, Tw_samples // 4]))
+    # Search overlap ratio in {0%, 25%, 50%}
+    # overlap = 1 - Ts/Tw  => Ts = Tw * (1 - overlap)
+    overlap_ratio = float(rng.choice([0.0, 0.25, 0.5]))
+    Ts_samples = max(1, int(round(Tw_samples * (1.0 - overlap_ratio))))
     windows_per_trial = int(rng.choice([8, 16, 32]))
     trials_per_axis = int(rng.choice([3, 4, 6]))
 

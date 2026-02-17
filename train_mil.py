@@ -16,7 +16,7 @@ from .augmentations import build_sup_augmentations
 from .baseModels import build_encoder, EncoderConfig, HierarchicalMILRegressor
 from .loss import MainFmaLoss, ConsistencyLoss
 from .ema import clone_as_ema_teacher, update_ema_model
-from .metrics import mae, rmse, normalized_mae, within_tolerance
+from .metrics import mae, rmse, normalized_mae, within_tolerance, r2_score, correlation
 from .utils import set_seed, seed_worker, ensure_dir, to_device, torch_load_compat
 
 
@@ -78,6 +78,45 @@ def _sigmoid_rampup(current: int, rampup_length: int) -> float:
     return float(math.exp(-5.0 * phase * phase))
 
 
+def _safe_mean(total: float, count: int) -> float:
+    if count <= 0:
+        return float("nan")
+    return float(total / count)
+
+
+def _save_loss_plot(history_df: pd.DataFrame, out_png: str) -> None:
+    """
+    Plot total/supervised/consistency and WH/SE head losses in a single figure.
+    """
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as e:
+        print(f"[WARN] Skip loss plot: matplotlib unavailable ({e})")
+        return
+
+    if len(history_df) == 0:
+        return
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    x = history_df["epoch"].to_numpy()
+    ax.plot(x, history_df["train_loss_total"].to_numpy(), label="total", linewidth=2.0)
+    ax.plot(x, history_df["train_loss_sup"].to_numpy(), label="L_sup", linewidth=1.8, linestyle="--")
+    ax.plot(x, history_df["train_loss_cons"].to_numpy(), label="L_cons", linewidth=1.8, linestyle=":")
+    ax.plot(x, history_df["train_loss_wh"].to_numpy(), label="head_wh", linewidth=1.8)
+    ax.plot(x, history_df["train_loss_se"].to_numpy(), label="head_se", linewidth=1.8)
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Loss")
+    ax.set_title("MIL Training Loss Curves")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=150)
+    plt.close(fig)
+
+
 @torch.no_grad()
 def evaluate_mil(model, dl, device) -> Dict[str, float]:
     model.eval()
@@ -114,6 +153,12 @@ def evaluate_mil(model, dl, device) -> Dict[str, float]:
     mae_wh = mae(ys_wh, yh_wh)
     mae_se = mae(ys_se, yh_se)
     mae_ue = mae(ys_wh + ys_se, yh_wh + yh_se)
+    r2_wh = r2_score(ys_wh, yh_wh)
+    r2_se = r2_score(ys_se, yh_se)
+    r2_ue = r2_score(ys_wh + ys_se, yh_wh + yh_se)
+    corr_wh = correlation(ys_wh, yh_wh)
+    corr_se = correlation(ys_se, yh_se)
+    corr_ue = correlation(ys_wh + ys_se, yh_wh + yh_se)
 
     nmae_wh = normalized_mae(ys_wh, yh_wh, 24.0)
     nmae_se = normalized_mae(ys_se, yh_se, 42.0)
@@ -123,6 +168,12 @@ def evaluate_mil(model, dl, device) -> Dict[str, float]:
         "MAE_WH": mae_wh,
         "MAE_SE": mae_se,
         "MAE_UE": mae_ue,
+        "R2_WH": r2_wh,
+        "R2_SE": r2_se,
+        "R2_UE": r2_ue,
+        "Corr_WH": corr_wh,
+        "Corr_SE": corr_se,
+        "Corr_UE": corr_ue,
         "RMSE_WH": rmse(ys_wh, yh_wh),
         "RMSE_SE": rmse(ys_se, yh_se),
         "within1_WH": within_tolerance(ys_wh, yh_wh, tol=1.0),
@@ -252,13 +303,26 @@ def train_mil_supervised(
 
     best_score = float("inf")
     best_path = os.path.join(out_dir, "best_mil.pth")
+    loss_csv_path = os.path.join(out_dir, "mil_loss_history.csv")
+    loss_png_path = os.path.join(out_dir, "mil_loss_curves.png")
     bad_epochs = 0
     global_step = 0
+    loss_history_rows = []
 
     for epoch in range(mil_cfg.epochs):
         student.train()
         pbar = tqdm(dl_train, desc=f"[MIL] epoch {epoch+1}/{mil_cfg.epochs}", leave=False)
         ramp = _sigmoid_rampup(epoch, mil_cfg.consistency_rampup_epochs)
+
+        ep_total_sum = 0.0
+        ep_sup_sum = 0.0
+        ep_cons_sum = 0.0
+        ep_wcons_sum = 0.0
+        ep_wh_sum = 0.0
+        ep_se_sum = 0.0
+        ep_steps = 0
+        ep_wh_steps = 0
+        ep_se_steps = 0
 
         for batch in pbar:
             global_step += 1
@@ -288,6 +352,15 @@ def train_mil_supervised(
                 yhat_wh_s, yhat_se_s = student(w1, wm1, tm1)
                 L_sup = sup_loss_fn(y_wh, y_se, yhat_wh_s, yhat_se_s, label_mask)
 
+                wh_mask = label_mask[:, 0]
+                se_mask = label_mask[:, 1]
+                L_wh = None
+                L_se = None
+                if wh_mask.any():
+                    L_wh = sup_loss_fn.huber(y_wh[wh_mask], yhat_wh_s[wh_mask], scale=24.0)
+                if se_mask.any():
+                    L_se = sup_loss_fn.huber(y_se[se_mask], yhat_se_s[se_mask], scale=42.0)
+
                 L_cons = torch.tensor(0.0, device=device)
                 if return_two_views and mil_cfg.consistency_weight > 0.0:
                     with torch.no_grad():
@@ -300,6 +373,18 @@ def train_mil_supervised(
 
                 w_cons = mil_cfg.consistency_weight * ramp if (return_two_views and mil_cfg.use_mean_teacher) else 0.0
                 L = L_sup + w_cons * L_cons
+
+            ep_steps += 1
+            ep_total_sum += float(L.item())
+            ep_sup_sum += float(L_sup.item())
+            ep_cons_sum += float(L_cons.item())
+            ep_wcons_sum += float(w_cons)
+            if L_wh is not None:
+                ep_wh_steps += 1
+                ep_wh_sum += float(L_wh.item())
+            if L_se is not None:
+                ep_se_steps += 1
+                ep_se_sum += float(L_se.item())
 
             scaler.scale(L).backward()
             if mil_cfg.grad_clip is not None and mil_cfg.grad_clip > 0:
@@ -326,6 +411,23 @@ def train_mil_supervised(
         val_metrics = evaluate_mil(teacher, dl_val, device)
         val_score = float(val_metrics["val_score"])
 
+        epoch_row = {
+            "epoch": int(epoch + 1),
+            "train_loss_total": _safe_mean(ep_total_sum, ep_steps),
+            "train_loss_sup": _safe_mean(ep_sup_sum, ep_steps),
+            "train_loss_cons": _safe_mean(ep_cons_sum, ep_steps),
+            "train_cons_weight": _safe_mean(ep_wcons_sum, ep_steps),
+            "train_loss_wh": _safe_mean(ep_wh_sum, ep_wh_steps),
+            "train_loss_se": _safe_mean(ep_se_sum, ep_se_steps),
+            "val_score": float(val_score),
+            "val_MAE_WH": float(val_metrics.get("MAE_WH", float("nan"))),
+            "val_MAE_SE": float(val_metrics.get("MAE_SE", float("nan"))),
+        }
+        loss_history_rows.append(epoch_row)
+        loss_df = pd.DataFrame(loss_history_rows)
+        loss_df.to_csv(loss_csv_path, index=False)
+        _save_loss_plot(loss_df, loss_png_path)
+
         if val_score < best_score:
             best_score = val_score
             bad_epochs = 0
@@ -336,6 +438,8 @@ def train_mil_supervised(
                 "encoder_cfg": asdict(enc_cfg),
                 "mil_cfg": asdict(mil_cfg),
                 "val_metrics": val_metrics,
+                "loss_history_csv": loss_csv_path,
+                "loss_history_plot": loss_png_path,
                 "epoch": epoch,
             }, best_path)
         else:
