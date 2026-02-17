@@ -1,0 +1,11 @@
+# Core numerical/data stack
+numpy>=1.24
+pandas>=2.0
+
+# Deep learning
+torch>=2.2
+mamba-ssm>=2.2.2
+
+# Utilities and visualization
+tqdm>=4.66
+matplotlib>=3.8
