@@ -115,6 +115,8 @@ def pretrain_ssl_moco(
     enc_cfg = encoder_cfg
     if encoder_cfg.encoder_type.lower() == "itransformer":
         enc_cfg = replace(encoder_cfg, itransformer_seq_len=ssl_cfg.Tw_samples)
+    elif encoder_cfg.encoder_type.lower() == "mgcn":
+        enc_cfg = replace(encoder_cfg, mgcn_seq_len=ssl_cfg.Tw_samples)
 
     encoder_q = build_encoder(enc_cfg).to(device)
     encoder_k = build_encoder(enc_cfg).to(device)

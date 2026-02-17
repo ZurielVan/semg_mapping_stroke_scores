@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .itransformer_official import OfficialITransformerEncoder
+from .mgcn_official import MGCNEncoderOfficial
 from .utils import masked_softmax
 
 
@@ -70,6 +71,50 @@ class TCNEncoder(nn.Module):
     def forward(self, x):
         x = self.stem(x)
         x = self.tcn(x)
+        x = x.mean(dim=-1)
+        x = self.proj(x)
+        return x
+
+
+class ResidualCNNBlock(nn.Module):
+    """
+    Standard residual CNN block (no temporal dilation).
+    """
+    def __init__(self, ch: int, k: int = 5, dropout: float = 0.1):
+        super().__init__()
+        p = k // 2
+        self.conv1 = nn.Conv1d(ch, ch, kernel_size=k, padding=p, bias=False)
+        self.norm1 = nn.GroupNorm(num_groups=min(8, ch), num_channels=ch)
+        self.act1 = nn.GELU()
+        self.drop1 = nn.Dropout(dropout)
+
+        self.conv2 = nn.Conv1d(ch, ch, kernel_size=k, padding=p, bias=False)
+        self.norm2 = nn.GroupNorm(num_groups=min(8, ch), num_channels=ch)
+        self.act2 = nn.GELU()
+        self.drop2 = nn.Dropout(dropout)
+
+    def forward(self, x):
+        res = x
+        x = self.drop1(self.act1(self.norm1(self.conv1(x))))
+        x = self.drop2(self.act2(self.norm2(self.conv2(x))))
+        return x + res
+
+
+class ResidualCNNEncoder(nn.Module):
+    """
+    Residual CNN encoder.
+    Input: (B, C=4, T)
+    Output: (B, d)
+    """
+    def __init__(self, in_ch=4, d=128, width=64, blocks=5, k=5, dropout=0.1, stem_stride=1):
+        super().__init__()
+        self.stem = ConvNormAct(in_ch, width, k=7, s=stem_stride, dropout=dropout)
+        self.blocks = nn.Sequential(*[ResidualCNNBlock(width, k=k, dropout=dropout) for _ in range(blocks)])
+        self.proj = nn.Linear(width, d)
+
+    def forward(self, x):
+        x = self.stem(x)
+        x = self.blocks(x)
         x = x.mean(dim=-1)
         x = self.proj(x)
         return x
@@ -336,7 +381,7 @@ class HierarchicalMILRegressor(nn.Module):
 
 @dataclass
 class EncoderConfig:
-    encoder_type: str = "tcn"  # tcn | transformer | itransformer | gcn | mamba
+    encoder_type: str = "tcn"  # tcn | rescnn | transformer | itransformer | gcn | mgcn | mamba
     emb_dim: int = 128
     dropout: float = 0.1
     # TCN
@@ -351,6 +396,14 @@ class EncoderConfig:
     ffn_ratio: int = 4
     # iTransformer
     itransformer_seq_len: int = 256
+    # MGCN
+    mgcn_seq_len: int = 256
+    mgcn_cheb_k: int = 2
+    mgcn_nb_chev_filter: int = 64
+    mgcn_nb_time_filter: int = 64
+    mgcn_d_model: int = 512
+    mgcn_layers: int = 1
+    mgcn_learn_adj: bool = True
     # GCN
     gcn_layers: int = 2
     gcn_learn_adj: bool = True
@@ -360,6 +413,12 @@ def build_encoder(cfg: EncoderConfig) -> nn.Module:
     et = cfg.encoder_type.lower()
     if et == "tcn":
         return TCNEncoder(
+            in_ch=4, d=cfg.emb_dim, width=cfg.tcn_width,
+            blocks=cfg.tcn_blocks, k=cfg.tcn_kernel,
+            dropout=cfg.dropout, stem_stride=cfg.tcn_stem_stride
+        )
+    if et == "rescnn":
+        return ResidualCNNEncoder(
             in_ch=4, d=cfg.emb_dim, width=cfg.tcn_width,
             blocks=cfg.tcn_blocks, k=cfg.tcn_kernel,
             dropout=cfg.dropout, stem_stride=cfg.tcn_stem_stride
@@ -381,6 +440,19 @@ def build_encoder(cfg: EncoderConfig) -> nn.Module:
             d=cfg.emb_dim, gcn_layers=cfg.gcn_layers,
             dropout=cfg.dropout, learn_adj=cfg.gcn_learn_adj,
             num_nodes=4
+        )
+    if et == "mgcn":
+        return MGCNEncoderOfficial(
+            in_ch=4,
+            d=cfg.emb_dim,
+            seq_len=cfg.mgcn_seq_len,
+            k_order=cfg.mgcn_cheb_k,
+            nb_chev_filter=cfg.mgcn_nb_chev_filter,
+            nb_time_filter=cfg.mgcn_nb_time_filter,
+            d_model=cfg.mgcn_d_model,
+            mamba_layers=cfg.mgcn_layers,
+            dropout=cfg.dropout,
+            learn_adj=cfg.mgcn_learn_adj,
         )
     if et == "mamba":
         return MambaEncoder(

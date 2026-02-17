@@ -30,7 +30,7 @@ def main() -> None:
     train_subjects = subjects[:3]
     val_subjects = subjects[3:4]
 
-    models = ["tcn", "transformer", "itransformer", "gcn", "mamba"]
+    models = ["tcn", "rescnn", "transformer", "itransformer", "gcn", "mgcn", "mamba"]
     os.makedirs(args.outdir, exist_ok=True)
 
     device = torch.device(args.device)

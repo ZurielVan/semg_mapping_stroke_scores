@@ -24,7 +24,7 @@ def parse_int_list(s: Optional[str]) -> Optional[list[int]]:
 
 
 def sample_hparams(rng: np.random.RandomState) -> Dict[str, Any]:
-    encoder_type = rng.choice(["tcn", "itransformer", "transformer", "gcn"])
+    encoder_type = rng.choice(["tcn", "rescnn", "itransformer", "transformer", "gcn", "mgcn"])
     emb_dim = int(rng.choice([64, 128, 256]))
     dropout = float(rng.choice([0.05, 0.1, 0.2, 0.3]))
 
