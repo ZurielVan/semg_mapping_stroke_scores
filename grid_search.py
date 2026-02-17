@@ -57,6 +57,128 @@ HPARAM_ORDER = [
     "gcn_learn_adj",
 ]
 
+PARAM_CANDIDATES: Dict[str, list[Any]] = {
+    "emb_dim": [64, 128, 256],
+    "dropout": [0.05, 0.1, 0.2, 0.3],
+    "Tw_samples": [256, 384, 512, 640],
+    "overlap_ratio": [0.0, 0.25, 0.5],
+    "windows_per_trial": [8, 16, 32],
+    "trials_per_axis": [3, 4, 6],
+    "lr_head": [3e-4, 1e-4, 3e-5],
+    "lr_encoder_scale": [0.1, 0.3, 1.0],
+    "weight_decay": [1e-4, 1e-3, 1e-2],
+    "huber_delta": [0.02, 0.04, 0.08],
+    "lambda_ue": [0.0, 0.05, 0.1, 0.2],
+    "ema_decay": [0.99, 0.995, 0.999],
+    "window_dropout_p": [0.0, 0.1, 0.2, 0.3],
+    "trial_dropout_p": [0.0, 0.05, 0.1, 0.15],
+    "consistency_weight": [0.0, 0.05, 0.1, 0.2, 0.4],
+    "consistency_rampup_epochs": [0, 10, 20, 40],
+    "consistency_loss_type": ["mse", "smoothl1"],
+    "patch_size": [4, 8, 16],
+    "layers": [2, 4, 6],
+    "heads": [2, 4, 8],
+    "ffn_ratio": [2, 4],
+    "tcn_blocks": [3, 5, 7],
+    "tcn_kernel": [3, 5, 7],
+    "tcn_width": [32, 64, 96],
+    "tcn_stem_stride": [1, 2],
+    "gcn_layers": [1, 2, 3],
+    "gcn_learn_adj": [False, True],
+}
+
+COMMON_PARAM_NAMES = [
+    "emb_dim",
+    "dropout",
+    "Tw_samples",
+    "overlap_ratio",
+    "windows_per_trial",
+    "trials_per_axis",
+    "lr_head",
+    "lr_encoder_scale",
+    "weight_decay",
+    "huber_delta",
+    "lambda_ue",
+    "ema_decay",
+    "window_dropout_p",
+    "trial_dropout_p",
+    "consistency_weight",
+    "consistency_rampup_epochs",
+    "consistency_loss_type",
+]
+
+MODEL_PARAM_NAMES: Dict[str, list[str]] = {
+    "tcn": ["tcn_blocks", "tcn_kernel", "tcn_width", "tcn_stem_stride"],
+    "rescnn": ["tcn_blocks", "tcn_kernel", "tcn_width", "tcn_stem_stride"],
+    "transformer": ["patch_size", "layers", "heads", "ffn_ratio"],
+    "itransformer": ["layers", "heads", "ffn_ratio"],
+    "gcn": ["gcn_layers", "gcn_learn_adj"],
+    "mamba": ["patch_size", "layers"],
+    "mgcn": [],
+}
+
+
+def active_param_names(encoder_type: str) -> list[str]:
+    et = str(encoder_type).lower()
+    if et not in MODEL_PARAM_NAMES:
+        raise ValueError(f"Unknown encoder_type: {encoder_type}")
+    return COMMON_PARAM_NAMES + MODEL_PARAM_NAMES[et]
+
+
+def active_hparam_space_for_encoder(encoder_type: str) -> Dict[str, list[Any]]:
+    names = active_param_names(encoder_type)
+    return {k: PARAM_CANDIDATES[k] for k in names}
+
+
+def _first_defaults_for_all_params() -> Dict[str, Any]:
+    return {k: v[0] for k, v in PARAM_CANDIDATES.items()}
+
+
+def build_hparams_for_encoder(encoder_type: str, selected_params: Dict[str, Any]) -> Dict[str, Any]:
+    params = _first_defaults_for_all_params()
+    params.update(selected_params)
+    return _build_hparams(
+        encoder_type=str(encoder_type),
+        emb_dim=int(params["emb_dim"]),
+        dropout=float(params["dropout"]),
+        Tw_samples=int(params["Tw_samples"]),
+        overlap_ratio=float(params["overlap_ratio"]),
+        windows_per_trial=int(params["windows_per_trial"]),
+        trials_per_axis=int(params["trials_per_axis"]),
+        lr_head=float(params["lr_head"]),
+        lr_encoder_scale=float(params["lr_encoder_scale"]),
+        weight_decay=float(params["weight_decay"]),
+        huber_delta=float(params["huber_delta"]),
+        lambda_ue=float(params["lambda_ue"]),
+        ema_decay=float(params["ema_decay"]),
+        window_dropout_p=float(params["window_dropout_p"]),
+        trial_dropout_p=float(params["trial_dropout_p"]),
+        consistency_weight=float(params["consistency_weight"]),
+        consistency_rampup_epochs=int(params["consistency_rampup_epochs"]),
+        consistency_loss_type=str(params["consistency_loss_type"]),
+        patch_size=int(params["patch_size"]),
+        layers=int(params["layers"]),
+        heads=int(params["heads"]),
+        ffn_ratio=int(params["ffn_ratio"]),
+        tcn_blocks=int(params["tcn_blocks"]),
+        tcn_kernel=int(params["tcn_kernel"]),
+        tcn_width=int(params["tcn_width"]),
+        tcn_stem_stride=int(params["tcn_stem_stride"]),
+        gcn_layers=int(params["gcn_layers"]),
+        gcn_learn_adj=bool(params["gcn_learn_adj"]),
+    )
+
+
+def search_space_summary(encoder_choices: list[str]) -> list[Dict[str, Any]]:
+    out = []
+    for et in encoder_choices:
+        space = active_hparam_space_for_encoder(et)
+        combos = 1
+        for vals in space.values():
+            combos *= len(vals)
+        out.append({"encoder_type": et, "space": space, "combos": int(combos)})
+    return out
+
 
 def _build_hparams(
     *,
@@ -123,83 +245,21 @@ def _build_hparams(
     )
 
 
-def _hparam_space(encoder_choices: list[str]) -> Dict[str, list[Any]]:
-    return {
-        "encoder_type": encoder_choices,
-        "emb_dim": [64, 128, 256],
-        "dropout": [0.05, 0.1, 0.2, 0.3],
-        "Tw_samples": [256, 384, 512, 640],
-        "overlap_ratio": [0.0, 0.25, 0.5],
-        "windows_per_trial": [8, 16, 32],
-        "trials_per_axis": [3, 4, 6],
-        "lr_head": [3e-4, 1e-4, 3e-5],
-        "lr_encoder_scale": [0.1, 0.3, 1.0],
-        "weight_decay": [1e-4, 1e-3, 1e-2],
-        "huber_delta": [0.02, 0.04, 0.08],
-        "lambda_ue": [0.0, 0.05, 0.1, 0.2],
-        "ema_decay": [0.99, 0.995, 0.999],
-        "window_dropout_p": [0.0, 0.1, 0.2, 0.3],
-        "trial_dropout_p": [0.0, 0.05, 0.1, 0.15],
-        "consistency_weight": [0.0, 0.05, 0.1, 0.2, 0.4],
-        "consistency_rampup_epochs": [0, 10, 20, 40],
-        "consistency_loss_type": ["mse", "smoothl1"],
-        "patch_size": [4, 8, 16],
-        "layers": [2, 4, 6],
-        "heads": [2, 4, 8],
-        "ffn_ratio": [2, 4],
-        "tcn_blocks": [3, 5, 7],
-        "tcn_kernel": [3, 5, 7],
-        "tcn_width": [32, 64, 96],
-        "tcn_stem_stride": [1, 2],
-        "gcn_layers": [1, 2, 3],
-        "gcn_learn_adj": [False, True],
-    }
-
-
 def grid_size(encoder_choices: list[str]) -> int:
-    space = _hparam_space(encoder_choices)
-    size = 1
-    for values in space.values():
-        size *= len(values)
-    return int(size)
+    total = 0
+    for info in search_space_summary(encoder_choices):
+        total += int(info["combos"])
+    return total
 
 
 def iter_grid_hparams(encoder_choices: list[str]):
-    space = _hparam_space(encoder_choices)
-    keys = list(space.keys())
-    values_list = [space[k] for k in keys]
-    for combo in itertools.product(*values_list):
-        combo_map = dict(zip(keys, combo))
-        yield _build_hparams(
-            encoder_type=str(combo_map["encoder_type"]),
-            emb_dim=int(combo_map["emb_dim"]),
-            dropout=float(combo_map["dropout"]),
-            Tw_samples=int(combo_map["Tw_samples"]),
-            overlap_ratio=float(combo_map["overlap_ratio"]),
-            windows_per_trial=int(combo_map["windows_per_trial"]),
-            trials_per_axis=int(combo_map["trials_per_axis"]),
-            lr_head=float(combo_map["lr_head"]),
-            lr_encoder_scale=float(combo_map["lr_encoder_scale"]),
-            weight_decay=float(combo_map["weight_decay"]),
-            huber_delta=float(combo_map["huber_delta"]),
-            lambda_ue=float(combo_map["lambda_ue"]),
-            ema_decay=float(combo_map["ema_decay"]),
-            window_dropout_p=float(combo_map["window_dropout_p"]),
-            trial_dropout_p=float(combo_map["trial_dropout_p"]),
-            consistency_weight=float(combo_map["consistency_weight"]),
-            consistency_rampup_epochs=int(combo_map["consistency_rampup_epochs"]),
-            consistency_loss_type=str(combo_map["consistency_loss_type"]),
-            patch_size=int(combo_map["patch_size"]),
-            layers=int(combo_map["layers"]),
-            heads=int(combo_map["heads"]),
-            ffn_ratio=int(combo_map["ffn_ratio"]),
-            tcn_blocks=int(combo_map["tcn_blocks"]),
-            tcn_kernel=int(combo_map["tcn_kernel"]),
-            tcn_width=int(combo_map["tcn_width"]),
-            tcn_stem_stride=int(combo_map["tcn_stem_stride"]),
-            gcn_layers=int(combo_map["gcn_layers"]),
-            gcn_learn_adj=bool(combo_map["gcn_learn_adj"]),
-        )
+    for et in encoder_choices:
+        space = active_hparam_space_for_encoder(et)
+        keys = list(space.keys())
+        values_list = [space[k] for k in keys]
+        for combo in itertools.product(*values_list):
+            selected = dict(zip(keys, combo))
+            yield build_hparams_for_encoder(et, selected)
 
 
 def check_mamba_ssm_available() -> tuple[bool, Optional[str]]:
@@ -213,75 +273,12 @@ def check_mamba_ssm_available() -> tuple[bool, Optional[str]]:
 def sample_hparams(rng: np.random.RandomState, encoder_choices: list[str]) -> Dict[str, Any]:
     if len(encoder_choices) == 0:
         raise ValueError("encoder_choices must not be empty")
-    encoder_type = rng.choice(encoder_choices)
-    emb_dim = int(rng.choice([64, 128, 256]))
-    dropout = float(rng.choice([0.05, 0.1, 0.2, 0.3]))
-
-    Tw_samples = int(rng.choice([256, 384, 512, 640]))
-    # Search overlap ratio in {0%, 25%, 50%}
-    # overlap = 1 - Ts/Tw  => Ts = Tw * (1 - overlap)
-    overlap_ratio = float(rng.choice([0.0, 0.25, 0.5]))
-    windows_per_trial = int(rng.choice([8, 16, 32]))
-    trials_per_axis = int(rng.choice([3, 4, 6]))
-
-    lr_head = float(rng.choice([3e-4, 1e-4, 3e-5]))
-    lr_encoder_scale = float(rng.choice([0.1, 0.3, 1.0]))
-    weight_decay = float(rng.choice([1e-4, 1e-3, 1e-2]))
-
-    huber_delta = float(rng.choice([0.02, 0.04, 0.08]))
-    lambda_ue = float(rng.choice([0.0, 0.05, 0.1, 0.2]))
-    ema_decay = float(rng.choice([0.99, 0.995, 0.999]))
-
-    window_dropout_p = float(rng.choice([0.0, 0.1, 0.2, 0.3]))
-    trial_dropout_p = float(rng.choice([0.0, 0.05, 0.1, 0.15]))
-
-    consistency_weight = float(rng.choice([0.0, 0.05, 0.1, 0.2, 0.4]))
-    consistency_rampup_epochs = int(rng.choice([0, 10, 20, 40]))
-    consistency_loss_type = rng.choice(["mse", "smoothl1"])
-
-    patch_size = int(rng.choice([4, 8, 16]))
-    layers = int(rng.choice([2, 4, 6]))
-    heads = int(rng.choice([2, 4, 8]))
-    ffn_ratio = int(rng.choice([2, 4]))
-
-    tcn_blocks = int(rng.choice([3, 5, 7]))
-    tcn_kernel = int(rng.choice([3, 5, 7]))
-    tcn_width = int(rng.choice([32, 64, 96]))
-    tcn_stem_stride = int(rng.choice([1, 2]))
-
-    gcn_layers = int(rng.choice([1, 2, 3]))
-    gcn_learn_adj = bool(rng.choice([0, 1]))
-
-    return _build_hparams(
-        encoder_type=encoder_type,
-        emb_dim=emb_dim,
-        dropout=dropout,
-        Tw_samples=Tw_samples,
-        overlap_ratio=overlap_ratio,
-        windows_per_trial=windows_per_trial,
-        trials_per_axis=trials_per_axis,
-        lr_head=lr_head,
-        lr_encoder_scale=lr_encoder_scale,
-        weight_decay=weight_decay,
-        huber_delta=huber_delta,
-        lambda_ue=lambda_ue,
-        ema_decay=ema_decay,
-        window_dropout_p=window_dropout_p,
-        trial_dropout_p=trial_dropout_p,
-        consistency_weight=consistency_weight,
-        consistency_rampup_epochs=consistency_rampup_epochs,
-        consistency_loss_type=consistency_loss_type,
-        patch_size=patch_size,
-        layers=layers,
-        heads=heads,
-        ffn_ratio=ffn_ratio,
-        tcn_blocks=tcn_blocks,
-        tcn_kernel=tcn_kernel,
-        tcn_width=tcn_width,
-        tcn_stem_stride=tcn_stem_stride,
-        gcn_layers=gcn_layers,
-        gcn_learn_adj=gcn_learn_adj,
-    )
+    et = str(rng.choice(encoder_choices))
+    space = active_hparam_space_for_encoder(et)
+    selected = {}
+    for k, vals in space.items():
+        selected[k] = rng.choice(vals)
+    return build_hparams_for_encoder(et, selected)
 
 
 def to_encoder_cfg(obj: Any) -> EncoderConfig:
@@ -333,6 +330,17 @@ def main():
             f"mamba-ssm is not usable: {mamba_reason}"
         )
     print(f"[INFO] Encoder search space: {encoder_choices}")
+    summaries = search_space_summary(encoder_choices)
+    total_effective = 0
+    for info in summaries:
+        et = str(info["encoder_type"])
+        combos = int(info["combos"])
+        total_effective += combos
+        print(f"[INFO] Active params for {et} (combos={combos}):")
+        for k, vals in info["space"].items():
+            vals_text = ", ".join(str(v) for v in vals)
+            print(f"  - {k} ({len(vals)}): {vals_text}")
+    print(f"[INFO] Total effective combinations per fold: {total_effective}")
     search_mode = "grid" if args.n_trials == -1 else "random"
     print(f"[INFO] Search mode: {search_mode}")
     if search_mode == "grid":

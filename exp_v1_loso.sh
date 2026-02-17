@@ -21,11 +21,13 @@ if [[ ! -f "${MANIFEST_CSV}" || ! -f "${LABELS_CSV}" ]]; then
   exit 1
 fi
 
+cd "${REPO_ROOT}"
+
 # For exhaustive grid traversal, print search-space summary and require confirmation.
 if [[ "${N_TRIALS}" == "-1" ]]; then
   echo "[INFO] N_TRIALS=-1 -> exhaustive grid traversal mode."
   "${PYTHON_BIN}" - <<'PY'
-from semg_mapping_stroke_scores.grid_search import _hparam_space, grid_size
+from semg_mapping_stroke_scores.grid_search import search_space_summary, grid_size
 
 encoder_choices = ["tcn", "rescnn", "itransformer", "transformer", "gcn"]
 from semg_mapping_stroke_scores.grid_search import check_mamba_ssm_available
@@ -39,14 +41,15 @@ else:
         f"mamba-ssm is not usable: {mamba_reason}"
     )
 
-space = _hparam_space(encoder_choices)
 total = grid_size(encoder_choices)
 
 print(f"[GRID] Total combinations per fold: {total}")
 print("[GRID] Search space table:")
-for k, vals in space.items():
-    vals_text = ", ".join(str(v) for v in vals)
-    print(f"  - {k} ({len(vals)}): {vals_text}")
+for info in search_space_summary(encoder_choices):
+    print(f"  * encoder_type={info['encoder_type']} (combos={info['combos']})")
+    for k, vals in info["space"].items():
+        vals_text = ", ".join(str(v) for v in vals)
+        print(f"    - {k} ({len(vals)}): {vals_text}")
 PY
 
   if [[ -t 0 ]]; then
@@ -65,8 +68,6 @@ PY
 fi
 
 mkdir -p "${OUTDIR}"
-
-cd "${REPO_ROOT}"
 
 "${PYTHON_BIN}" -m semg_mapping_stroke_scores.grid_search \
   --manifest_csv "${MANIFEST_CSV}" \
