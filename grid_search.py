@@ -56,6 +56,24 @@ HPARAM_ORDER = [
     "gcn_layers",
     "gcn_learn_adj",
 ]
+TEST_METRIC_KEYS = [
+    "MAE_WH",
+    "MAE_SE",
+    "MAE_UE",
+    "R2_WH",
+    "R2_SE",
+    "R2_UE",
+    "Corr_WH",
+    "Corr_SE",
+    "Corr_UE",
+    "RMSE_WH",
+    "RMSE_SE",
+    "within1_WH",
+    "within2_WH",
+    "within1_SE",
+    "within2_SE",
+    "val_score",
+]
 
 PARAM_CANDIDATES: Dict[str, list[Any]] = {
     "emb_dim": [64, 128, 256],
@@ -281,6 +299,52 @@ def sample_hparams(rng: np.random.RandomState, encoder_choices: list[str]) -> Di
     return build_hparams_for_encoder(et, selected)
 
 
+def hparams_key(hps: Dict[str, Any]) -> tuple:
+    return tuple(hps[k] for k in HPARAM_ORDER)
+
+
+def sample_unique_hparams(
+    rng: np.random.RandomState,
+    encoder_choices: list[str],
+    n_trials: int,
+) -> list[Dict[str, Any]]:
+    if n_trials <= 0:
+        return []
+    total = grid_size(encoder_choices)
+    target = min(int(n_trials), int(total))
+    if target < n_trials:
+        print(
+            f"[WARN] Requested n_trials={n_trials} but effective search space has only {total} "
+            f"unique combinations. Use {target}."
+        )
+    picked = []
+    seen = set()
+    while len(picked) < target:
+        hps = sample_hparams(rng, encoder_choices)
+        key = hparams_key(hps)
+        if key in seen:
+            continue
+        seen.add(key)
+        picked.append(hps)
+    return picked
+
+
+def mean_numeric(values: list[float], default: float = float("nan")) -> float:
+    arr = np.asarray(values, dtype=float)
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return float(default)
+    return float(np.mean(finite))
+
+
+def mean_test_metrics(rows: list[Dict[str, Any]]) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    for k in TEST_METRIC_KEYS:
+        vals = [float(r[k]) for r in rows if k in r]
+        out[k] = mean_numeric(vals, default=float("nan"))
+    return out
+
+
 def to_encoder_cfg(obj: Any) -> EncoderConfig:
     if isinstance(obj, EncoderConfig):
         return obj
@@ -315,6 +379,8 @@ def main():
     ap.add_argument("--ssl_epochs", type=int, default=100)
     ap.add_argument("--ssl_windows_per_epoch", type=int, default=20000)
     args = ap.parse_args()
+    if args.n_trials == 0 or args.n_trials < -1:
+        raise ValueError("n_trials must be > 0 for random search, or -1 for exhaustive grid search.")
 
     ensure_dir(args.outdir)
     set_seed(args.seed)
@@ -363,6 +429,19 @@ def main():
     summary_path = os.path.join(args.outdir, "summary.jsonl")
     if os.path.exists(summary_path):
         os.remove(summary_path)
+    trial_summary_jsonl = os.path.join(args.outdir, "loso_trial_summary.jsonl")
+    if os.path.exists(trial_summary_jsonl):
+        os.remove(trial_summary_jsonl)
+    trial_summary_csv_path = os.path.join(args.outdir, "loso_trial_summary.csv")
+    if os.path.exists(trial_summary_csv_path):
+        os.remove(trial_summary_csv_path)
+
+    trial_summary_fields = (
+        ["trial_id", "search_mode", "n_folds", "mean_fold_val_score"]
+        + [f"mean_test_{k}" for k in TEST_METRIC_KEYS]
+        + HPARAM_ORDER
+    )
+
     grid_csv_writer = None
     grid_csv_file = None
     if search_mode == "grid":
@@ -370,39 +449,57 @@ def main():
         if os.path.exists(grid_csv_path):
             os.remove(grid_csv_path)
         grid_csv_file = open(grid_csv_path, "w", newline="", encoding="utf-8")
-        grid_csv_columns = ["fold_id", "test_subject", "trial_id", "trial_dir", "val_score"] + HPARAM_ORDER
-        grid_csv_writer = csv.DictWriter(grid_csv_file, fieldnames=grid_csv_columns)
+        grid_csv_writer = csv.DictWriter(grid_csv_file, fieldnames=trial_summary_fields)
         grid_csv_writer.writeheader()
 
-    try:
-        for fold_id, (test_subject, train_pool) in enumerate(folds):
-            fold_dir = os.path.join(args.outdir, f"fold_{fold_id:02d}_test_{test_subject}")
-            ensure_dir(fold_dir)
+    trial_csv_file = open(trial_summary_csv_path, "w", newline="", encoding="utf-8")
+    trial_csv_writer = csv.DictWriter(trial_csv_file, fieldnames=trial_summary_fields)
+    trial_csv_writer.writeheader()
 
-            inner_train, val_subjects = split_train_val_subjects(train_pool, n_val=args.n_val_subjects, seed=args.seed + fold_id)
-
-            fold_record = {
+    fold_infos = []
+    fold_records: Dict[int, Dict[str, Any]] = {}
+    for fold_id, (test_subject, train_pool) in enumerate(folds):
+        fold_dir = os.path.join(args.outdir, f"fold_{fold_id:02d}_test_{test_subject}")
+        ensure_dir(fold_dir)
+        inner_train, val_subjects = split_train_val_subjects(train_pool, n_val=args.n_val_subjects, seed=args.seed + fold_id)
+        fold_infos.append(
+            {
                 "fold_id": fold_id,
-                "test_subject": test_subject,
-                "val_subjects": val_subjects,
-                "inner_train_subjects": inner_train,
-                "search_mode": search_mode,
-                "trials": []
+                "test_subject": str(test_subject),
+                "train_subjects": [str(s) for s in inner_train],
+                "val_subjects": [str(s) for s in val_subjects],
+                "fold_dir": fold_dir,
             }
+        )
+        fold_records[fold_id] = {
+            "fold_id": fold_id,
+            "test_subject": str(test_subject),
+            "val_subjects": [str(s) for s in val_subjects],
+            "inner_train_subjects": [str(s) for s in inner_train],
+            "search_mode": search_mode,
+            "trials": [],
+        }
 
-            rng = np.random.RandomState(args.seed + 1000 * fold_id)
+    if search_mode == "grid":
+        trial_iter = enumerate(iter_grid_hparams(encoder_choices))
+    else:
+        rng = np.random.RandomState(args.seed + 1000)
+        fixed_trials = sample_unique_hparams(rng, encoder_choices, args.n_trials)
+        print(f"[INFO] Fixed unique trial count: {len(fixed_trials)}")
+        trial_iter = enumerate(fixed_trials)
 
-            best_val = float("inf")
-            best_ckpt = None
-            best_hparams = None
-            best_trial_dir = None
+    try:
+        for t, hps in trial_iter:
+            trial_fold_vals: list[float] = []
+            trial_fold_tests: list[Dict[str, Any]] = []
 
-            if search_mode == "grid":
-                trial_iter = enumerate(iter_grid_hparams(encoder_choices))
-            else:
-                trial_iter = ((t, sample_hparams(rng, encoder_choices)) for t in range(args.n_trials))
+            for fold_info in fold_infos:
+                fold_id = int(fold_info["fold_id"])
+                test_subject = str(fold_info["test_subject"])
+                inner_train = list(fold_info["train_subjects"])
+                val_subjects = list(fold_info["val_subjects"])
+                fold_dir = str(fold_info["fold_dir"])
 
-            for t, hps in trial_iter:
                 trial_dir = os.path.join(fold_dir, f"trial_{t:03d}")
                 ensure_dir(trial_dir)
 
@@ -491,112 +588,127 @@ def main():
 
                 ckpt = torch_load_compat(mil_ckpt, map_location="cpu")
                 val_metrics = ckpt["val_metrics"]
-                val_score = float(val_metrics["val_score"])
+                fold_val_score = float(val_metrics.get("val_score", float("inf")))
+                trial_fold_vals.append(fold_val_score)
 
-                trial_rec = {
-                    "trial_id": t,
-                    "hparams": hps,
-                    "val_metrics": val_metrics,
-                    "mil_ckpt": mil_ckpt,
-                    "ssl_ckpt": ssl_ckpt,
-                }
-                fold_record["trials"].append(trial_rec)
-                if search_mode == "grid" and grid_csv_writer is not None:
-                    row = {
-                        "fold_id": fold_id,
-                        "test_subject": str(test_subject),
-                        "trial_id": t,
-                        "trial_dir": trial_dir,
-                        "val_score": val_score,
-                    }
-                    for k in HPARAM_ORDER:
-                        row[k] = hps.get(k)
-                    grid_csv_writer.writerow(row)
-                    grid_csv_file.flush()
-
-                # Fallback: keep the first successful trial checkpoint to avoid
-                # best_ckpt staying None when all val_score are inf.
-                if best_ckpt is None:
-                    best_ckpt = mil_ckpt
-                    best_hparams = hps
-                    best_trial_dir = trial_dir
-
-                if val_score < best_val:
-                    best_val = val_score
-                    best_ckpt = mil_ckpt
-                    best_hparams = hps
-                    best_trial_dir = trial_dir
-
-            if best_ckpt is None:
-                raise RuntimeError(
-                    f"No valid trial checkpoint found in fold {fold_id} "
-                    f"(test_subject={test_subject}). Check n_trials and training logs."
+                enc_cfg_best = to_encoder_cfg(ckpt["encoder_cfg"])
+                mil_cfg_best = to_mil_cfg(ckpt["mil_cfg"])
+                test_ds = SessionBagDataset(
+                    manifest_df, labels_df, subjects=[test_subject],
+                    Tw_samples=mil_cfg_best.Tw_samples, Ts_samples=mil_cfg_best.Ts_samples,
+                    windows_per_trial=mil_cfg_best.windows_per_trial,
+                    trials_per_axis=mil_cfg_best.trials_per_axis,
+                    mode="test",
+                    supervised_aug=None,
+                    return_two_views=False,
+                    emg_cols=mil_cfg_best.emg_cols,
+                    time_col=mil_cfg_best.time_col,
+                    expected_emg_ch=mil_cfg_best.expected_emg_ch,
+                    cache_size=64,
+                )
+                test_dl = DataLoader(
+                    test_ds,
+                    batch_size=mil_cfg_best.batch_sessions,
+                    shuffle=False,
+                    num_workers=2,
+                    pin_memory=True,
+                    worker_init_fn=seed_worker,
                 )
 
-            # Evaluate best teacher model on test subject
-            ckpt = torch_load_compat(best_ckpt, map_location="cpu")
-            enc_cfg = to_encoder_cfg(ckpt["encoder_cfg"])
-            mil_cfg = to_mil_cfg(ckpt["mil_cfg"])
+                teacher = HierarchicalMILRegressor(
+                    encoder=build_encoder(enc_cfg_best),
+                    emb_dim=enc_cfg_best.emb_dim,
+                    attn_hidden=mil_cfg_best.attn_hidden,
+                    fusion_hidden=mil_cfg_best.fusion_hidden,
+                    dropout=mil_cfg_best.dropout,
+                    window_dropout_p=0.0,
+                    trial_dropout_p=0.0,
+                ).to(device)
+                teacher.load_state_dict(ckpt["teacher"], strict=True)
+                test_metrics = evaluate_mil(teacher, test_dl, device)
+                trial_fold_tests.append(test_metrics)
 
-            test_ds = SessionBagDataset(
-                manifest_df, labels_df, subjects=[test_subject],
-                Tw_samples=mil_cfg.Tw_samples, Ts_samples=mil_cfg.Ts_samples,
-                windows_per_trial=mil_cfg.windows_per_trial,
-                trials_per_axis=mil_cfg.trials_per_axis,
-                mode="test",
-                supervised_aug=None,
-                return_two_views=False,
-                emg_cols=mil_cfg.emg_cols,
-                time_col=mil_cfg.time_col,
-                expected_emg_ch=mil_cfg.expected_emg_ch,
-                cache_size=64,
-            )
-            test_dl = DataLoader(test_ds, batch_size=mil_cfg.batch_sessions, shuffle=False, num_workers=2, pin_memory=True, worker_init_fn=seed_worker)
+                split_info = dict(ckpt.get("split_info", {}))
+                split_info.update(
+                    {
+                        "trial_id": int(t),
+                        "fold_id": fold_id,
+                        "test_subject": str(test_subject),
+                        "val_subjects": [str(s) for s in val_subjects],
+                        "train_subjects": [str(s) for s in inner_train],
+                    }
+                )
+                ckpt["split_info"] = split_info
+                ckpt["test_metrics"] = test_metrics
+                torch.save(ckpt, mil_ckpt)
 
-            teacher = HierarchicalMILRegressor(
-                encoder=build_encoder(enc_cfg),
-                emb_dim=enc_cfg.emb_dim,
-                attn_hidden=mil_cfg.attn_hidden,
-                fusion_hidden=mil_cfg.fusion_hidden,
-                dropout=mil_cfg.dropout,
-                window_dropout_p=0.0,
-                trial_dropout_p=0.0,
-            ).to(device)
-            teacher.load_state_dict(ckpt["teacher"], strict=True)
+                fold_records[fold_id]["trials"].append(
+                    {
+                        "trial_id": int(t),
+                        "hparams": hps,
+                        "val_metrics": val_metrics,
+                        "test_metrics": test_metrics,
+                        "mil_ckpt": mil_ckpt,
+                        "ssl_ckpt": ssl_ckpt,
+                    }
+                )
 
-            test_metrics = evaluate_mil(teacher, test_dl, device)
+            if len(trial_fold_tests) == 0:
+                raise RuntimeError(f"No fold result produced for trial {t}.")
 
-            # Enrich best checkpoint with full split metadata for single-file traceability.
-            split_info = dict(ckpt.get("split_info", {}))
-            split_info.update(
-                {
-                    "fold_id": fold_id,
-                    "test_subject": str(test_subject),
-                    "val_subjects": [str(s) for s in val_subjects],
-                    "train_subjects": [str(s) for s in inner_train],
-                }
-            )
-            ckpt["split_info"] = split_info
-            ckpt["test_metrics"] = test_metrics
-            torch.save(ckpt, best_ckpt)
-
-            fold_record["best"] = {
-                "best_val": best_val,
-                "best_trial_dir": best_trial_dir,
-                "best_hparams": best_hparams,
-                "best_ckpt": best_ckpt,
-                "test_metrics": test_metrics,
+            mean_tests = mean_test_metrics(trial_fold_tests)
+            trial_row: Dict[str, Any] = {
+                "trial_id": int(t),
+                "search_mode": search_mode,
+                "n_folds": len(trial_fold_tests),
+                "mean_fold_val_score": mean_numeric(trial_fold_vals, default=float("inf")),
             }
+            for k in TEST_METRIC_KEYS:
+                trial_row[f"mean_test_{k}"] = float(mean_tests.get(k, float("nan")))
+            for k in HPARAM_ORDER:
+                trial_row[k] = hps.get(k)
 
+            trial_csv_writer.writerow(trial_row)
+            trial_csv_file.flush()
+            append_jsonl(trial_summary_jsonl, trial_row)
+            if grid_csv_writer is not None:
+                grid_csv_writer.writerow(trial_row)
+                grid_csv_file.flush()
+
+        for fold_info in fold_infos:
+            fold_id = int(fold_info["fold_id"])
+            fold_dir = str(fold_info["fold_dir"])
+            fold_record = fold_records[fold_id]
+            trials = fold_record.get("trials", [])
+            if len(trials) == 0:
+                raise RuntimeError(
+                    f"No valid trial checkpoint found in fold {fold_id} "
+                    f"(test_subject={fold_info['test_subject']}). Check n_trials and training logs."
+                )
+            best_trial = min(
+                trials,
+                key=lambda tr: float(tr.get("val_metrics", {}).get("val_score", float("inf")))
+            )
+            best_ckpt = best_trial["mil_ckpt"]
+            fold_record["best"] = {
+                "best_val": float(best_trial.get("val_metrics", {}).get("val_score", float("inf"))),
+                "best_trial_id": int(best_trial["trial_id"]),
+                "best_trial_dir": os.path.dirname(os.path.dirname(best_ckpt)),
+                "best_hparams": best_trial["hparams"],
+                "best_ckpt": best_ckpt,
+                "test_metrics": best_trial["test_metrics"],
+            }
             save_json(os.path.join(fold_dir, "fold_record.json"), fold_record)
             append_jsonl(summary_path, {
                 "fold_id": fold_id,
-                "test_subject": test_subject,
-                "best_val": best_val,
-                "test_metrics": test_metrics,
-                "best_hparams": best_hparams,
+                "test_subject": fold_record["test_subject"],
+                "best_val": fold_record["best"]["best_val"],
+                "test_metrics": fold_record["best"]["test_metrics"],
+                "best_hparams": fold_record["best"]["best_hparams"],
+                "best_trial_id": fold_record["best"]["best_trial_id"],
             })
     finally:
+        trial_csv_file.close()
         if grid_csv_file is not None:
             grid_csv_file.close()
 

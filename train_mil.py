@@ -411,6 +411,7 @@ def train_mil_supervised(
     bad_epochs = 0
     global_step = 0
     loss_history_rows = []
+    last_ckpt_payload = None
 
     for epoch in range(mil_cfg.epochs):
         student.train()
@@ -533,28 +534,43 @@ def train_mil_supervised(
         loss_df.to_csv(loss_csv_path, index=False)
         _save_loss_plot(loss_df, loss_png_path)
 
+        ckpt_payload = {
+            "student": student.state_dict(),
+            "teacher": teacher.state_dict(),
+            # Store plain dicts for cross-version safety.
+            "encoder_cfg": asdict(enc_cfg),
+            "mil_cfg": asdict(mil_cfg),
+            "split_info": {
+                "train_subjects": [str(s) for s in train_subjects],
+                "val_subjects": [str(s) for s in val_subjects],
+            },
+            "val_metrics": val_metrics,
+            "loss_history_csv": loss_csv_path,
+            "loss_history_plot": loss_png_path,
+            "epoch": epoch,
+        }
+        last_ckpt_payload = ckpt_payload
+
         if val_score < best_score:
             best_score = val_score
             bad_epochs = 0
-            torch.save({
-                "student": student.state_dict(),
-                "teacher": teacher.state_dict(),
-                # Store plain dicts for cross-version safety.
-                "encoder_cfg": asdict(enc_cfg),
-                "mil_cfg": asdict(mil_cfg),
-                "split_info": {
-                    "train_subjects": [str(s) for s in train_subjects],
-                    "val_subjects": [str(s) for s in val_subjects],
-                },
-                "val_metrics": val_metrics,
-                "loss_history_csv": loss_csv_path,
-                "loss_history_plot": loss_png_path,
-                "epoch": epoch,
-            }, best_path)
+            torch.save(ckpt_payload, best_path)
         else:
             bad_epochs += 1
 
         if bad_epochs >= mil_cfg.patience:
             break
+
+    if not os.path.exists(best_path):
+        if last_ckpt_payload is None:
+            raise RuntimeError("MIL training ended without producing any checkpoint payload.")
+        fallback_payload = dict(last_ckpt_payload)
+        fallback_payload["fallback_used"] = True
+        fallback_payload["fallback_reason"] = "no_epoch_improved_val_score"
+        torch.save(fallback_payload, best_path)
+        print(
+            "[WARN] No epoch improved validation score; saved last-epoch fallback checkpoint "
+            f"to {best_path}"
+        )
 
     return best_path
