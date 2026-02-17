@@ -1,11 +1,15 @@
 # Core numerical/data stack
-numpy>=1.24
-pandas>=2.0
+numpy==1.26.4
+pandas==2.2.3
 
-# Deep learning
-torch>=2.2
-mamba-ssm>=2.2.2
+# Deep learning (pinned for mgcn/mamba stability)
+# NOTE:
+# 1) Install torch with CUDA-matched wheel first (cu118/cu121 etc.)
+# 2) Then install this file to keep ABI-compatible mamba stack.
+torch==2.3.1
+mamba-ssm==2.2.2
+causal-conv1d==1.4.0
 
 # Utilities and visualization
-tqdm>=4.66
-matplotlib>=3.8
+tqdm==4.66.5
+matplotlib==3.9.2

@@ -21,6 +21,49 @@ if [[ ! -f "${MANIFEST_CSV}" || ! -f "${LABELS_CSV}" ]]; then
   exit 1
 fi
 
+# For exhaustive grid traversal, print search-space summary and require confirmation.
+if [[ "${N_TRIALS}" == "-1" ]]; then
+  echo "[INFO] N_TRIALS=-1 -> exhaustive grid traversal mode."
+  "${PYTHON_BIN}" - <<'PY'
+from semg_mapping_stroke_scores.grid_search import _hparam_space, grid_size
+
+encoder_choices = ["tcn", "rescnn", "itransformer", "transformer", "gcn"]
+from semg_mapping_stroke_scores.grid_search import check_mamba_ssm_available
+mamba_ok, mamba_reason = check_mamba_ssm_available()
+if mamba_ok:
+    encoder_choices.append("mamba")
+    encoder_choices.append("mgcn")
+else:
+    print(
+        "[WARN] Disable encoder_type in {'mamba','mgcn'} for this run because "
+        f"mamba-ssm is not usable: {mamba_reason}"
+    )
+
+space = _hparam_space(encoder_choices)
+total = grid_size(encoder_choices)
+
+print(f"[GRID] Total combinations per fold: {total}")
+print("[GRID] Search space table:")
+for k, vals in space.items():
+    vals_text = ", ".join(str(v) for v in vals)
+    print(f"  - {k} ({len(vals)}): {vals_text}")
+PY
+
+  if [[ -t 0 ]]; then
+    read -r -p "Proceed with exhaustive grid traversal? [y/N]: " CONFIRM_GRID
+    case "${CONFIRM_GRID}" in
+      y|Y) ;;
+      *)
+        echo "Cancelled by user."
+        exit 0
+        ;;
+    esac
+  else
+    echo "N_TRIALS=-1 requires interactive confirmation (tty). Aborting."
+    exit 1
+  fi
+fi
+
 mkdir -p "${OUTDIR}"
 
 cd "${REPO_ROOT}"
