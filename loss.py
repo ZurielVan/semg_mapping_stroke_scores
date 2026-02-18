@@ -39,7 +39,7 @@ class MainFmaLoss(nn.Module):
         label_mask: torch.Tensor
     ) -> torch.Tensor:
         # label_mask: (B,2)
-        loss = 0.0
+        loss = torch.zeros((), device=y_wh.device, dtype=y_wh.dtype)
         denom = 0.0
 
         wh_mask = label_mask[:, 0]
@@ -60,6 +60,10 @@ class MainFmaLoss(nn.Module):
                 loss = loss + self.lambda_ue * self.huber(y_ue[ue_mask], yhat_ue[ue_mask], scale=66.0)
                 denom += self.lambda_ue
 
+        if denom <= 0.0:
+            # Keep a valid autograd path even when this batch has no active labels
+            # under the current target mode.
+            return (yhat_wh.sum() + yhat_se.sum()) * 0.0
         return loss / max(1e-8, denom)
 
 

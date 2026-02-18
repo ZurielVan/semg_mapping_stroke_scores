@@ -280,6 +280,78 @@ class GatedAttnScore(nn.Module):
         return s
 
 
+class TemporalWindowAggregator(nn.Module):
+    """
+    Order-aware window aggregator:
+      - add position embedding from sampled window start indices
+      - run lightweight Transformer over window tokens within each trial
+    """
+    def __init__(
+        self,
+        emb_dim: int,
+        layers: int = 2,
+        heads: int = 4,
+        ffn_ratio: int = 2,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.emb_dim = int(emb_dim)
+        self.pos_proj = nn.Sequential(
+            nn.Linear(1, emb_dim),
+            nn.GELU(),
+            nn.Linear(emb_dim, emb_dim),
+        )
+        if layers > 0:
+            enc_layer = nn.TransformerEncoderLayer(
+                d_model=emb_dim,
+                nhead=heads,
+                dim_feedforward=emb_dim * ffn_ratio,
+                dropout=dropout,
+                batch_first=True,
+                activation="gelu",
+                norm_first=True,
+            )
+            self.temporal = nn.TransformerEncoder(enc_layer, num_layers=layers)
+        else:
+            self.temporal = None
+        self.norm = nn.LayerNorm(emb_dim)
+
+    def forward(
+        self,
+        h: torch.Tensor,
+        mask: torch.Tensor,
+        window_starts: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        h: (N, K, d)
+        mask: (N, K), True=valid
+        window_starts: (N, K) int/float, start index in samples
+        """
+        N, K, _ = h.shape
+        if window_starts is None:
+            pos = torch.arange(K, device=h.device, dtype=h.dtype).unsqueeze(0).expand(N, K)
+        else:
+            pos_raw = window_starts.to(device=h.device, dtype=h.dtype)
+            pos_raw = torch.where(mask, pos_raw, torch.zeros_like(pos_raw))
+            denom = torch.clamp(pos_raw.max(dim=-1, keepdim=True).values, min=1.0)
+            pos = pos_raw / denom
+
+        x = h + self.pos_proj(pos.unsqueeze(-1))
+        row_has_valid = mask.any(dim=-1)
+
+        out = torch.zeros_like(x)
+        if bool(row_has_valid.any()):
+            x_valid = x[row_has_valid]
+            mask_valid = mask[row_has_valid]
+            if self.temporal is not None:
+                x_valid = self.temporal(x_valid, src_key_padding_mask=~mask_valid)
+            x_valid = self.norm(x_valid)
+            out[row_has_valid] = x_valid
+
+        out = torch.where(mask.unsqueeze(-1), out, torch.zeros_like(out))
+        return out
+
+
 def _apply_dropout_to_mask(mask: torch.Tensor, p: float) -> torch.Tensor:
     """
     mask: bool tensor
@@ -321,9 +393,15 @@ class HierarchicalMILRegressor(nn.Module):
         dropout: float = 0.1,
         window_dropout_p: float = 0.2,
         trial_dropout_p: float = 0.1,
+        window_agg_mode: str = "set_attn",
+        window_temporal_layers: int = 2,
+        window_temporal_heads: int = 4,
+        window_temporal_ffn_ratio: int = 2,
+        window_temporal_dropout: float = 0.1,
     ):
         super().__init__()
         self.encoder = encoder
+        self.emb_dim = int(emb_dim)
         self.win_score = GatedAttnScore(emb_dim, attn_hidden)
         self.trial_score = GatedAttnScore(emb_dim, attn_hidden)
 
@@ -340,18 +418,55 @@ class HierarchicalMILRegressor(nn.Module):
 
         self.window_dropout_p = float(window_dropout_p)
         self.trial_dropout_p = float(trial_dropout_p)
+        self.window_agg_mode = str(window_agg_mode).strip().lower()
+        if self.window_agg_mode not in {"set_attn", "temporal_transformer"}:
+            raise ValueError(
+                f"Unsupported window_agg_mode={window_agg_mode}. "
+                "Supported: {'set_attn', 'temporal_transformer'}"
+            )
+        self.window_temporal = None
+        if self.window_agg_mode == "temporal_transformer":
+            self.window_temporal = TemporalWindowAggregator(
+                emb_dim=emb_dim,
+                layers=window_temporal_layers,
+                heads=window_temporal_heads,
+                ffn_ratio=window_temporal_ffn_ratio,
+                dropout=window_temporal_dropout,
+            )
 
-    def forward(self, windows, window_mask, trial_mask):
+    def _encode_windows(self, windows: torch.Tensor, window_mask: torch.Tensor) -> torch.Tensor:
+        """
+        Encode only valid windows to reduce unnecessary compute/memory on padded slots.
+        """
         B, A, R, K, C, Tw = windows.shape
         x = windows.view(B * A * R * K, C, Tw)
-        h = self.encoder(x)  # (B*A*R*K, d)
+        flat_mask = window_mask.view(B * A * R * K)
+        if bool(flat_mask.all()):
+            h = self.encoder(x)
+        elif bool(flat_mask.any()):
+            h_valid = self.encoder(x[flat_mask])
+            h = h_valid.new_zeros((x.shape[0], h_valid.shape[-1]))
+            h[flat_mask] = h_valid
+        else:
+            h = x.new_zeros((x.shape[0], self.emb_dim))
+        return h.view(B, A, R, K, -1)
+
+    def forward(self, windows, window_mask, trial_mask, window_starts: Optional[torch.Tensor] = None):
+        B, A, R, K, C, Tw = windows.shape
+        h = self._encode_windows(windows, window_mask)  # (B,A,R,K,d)
         d = h.shape[-1]
-        h = h.view(B, A, R, K, d)
 
         # stochastic instance dropout (mask-level) for robustness
         if self.training:
             window_mask = _apply_dropout_to_mask(window_mask, self.window_dropout_p)
             trial_mask = _apply_dropout_to_mask(trial_mask, self.trial_dropout_p)
+
+        if self.window_temporal is not None:
+            h_bar = h.view(B * A * R, K, d)
+            m_bar = window_mask.view(B * A * R, K)
+            s_bar = None if window_starts is None else window_starts.view(B * A * R, K)
+            h_bar = self.window_temporal(h_bar, m_bar, s_bar)
+            h = h_bar.view(B, A, R, K, d)
 
         # window -> trial attention
         win_logits = self.win_score(h)  # (B,A,R,K)

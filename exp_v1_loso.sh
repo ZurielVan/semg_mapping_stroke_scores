@@ -15,6 +15,21 @@ SEED="${SEED:-19990514}"
 DEVICE="${DEVICE:-cuda}"
 SSL_EPOCHS="${SSL_EPOCHS:-100}"
 SSL_WINDOWS_PER_EPOCH="${SSL_WINDOWS_PER_EPOCH:-20000}"
+SSL_USE_MASKED_RECON="${SSL_USE_MASKED_RECON:-true}"
+SSL_RECON_WEIGHT="${SSL_RECON_WEIGHT:-0.5}"
+SSL_MASK_RATIO="${SSL_MASK_RATIO:-0.5}"
+SSL_MASK_BLOCK_LEN="${SSL_MASK_BLOCK_LEN:-16}"
+SSL_MASK_MODE="${SSL_MASK_MODE:-time}"
+SSL_RECON_DECODER_HIDDEN="${SSL_RECON_DECODER_HIDDEN:-256}"
+SSL_RECON_LOSS_TYPE="${SSL_RECON_LOSS_TYPE:-smoothl1}"
+SSL_RECON_SMOOTHL1_BETA="${SSL_RECON_SMOOTHL1_BETA:-0.02}"
+TARGET_MODE="${TARGET_MODE:-whse}"
+ENCODER_CHOICES="${ENCODER_CHOICES:-itransformer}"
+WINDOW_AGG_MODE="${WINDOW_AGG_MODE:-temporal_transformer}"
+WINDOW_TEMPORAL_LAYERS="${WINDOW_TEMPORAL_LAYERS:-2}"
+WINDOW_TEMPORAL_HEADS="${WINDOW_TEMPORAL_HEADS:-4}"
+WINDOW_TEMPORAL_FFN_RATIO="${WINDOW_TEMPORAL_FFN_RATIO:-2}"
+WINDOW_TEMPORAL_DROPOUT="${WINDOW_TEMPORAL_DROPOUT:-0.1}"
 
 if [[ ! -f "${MANIFEST_CSV}" || ! -f "${LABELS_CSV}" ]]; then
   echo "Missing dataset CSVs. Run: bash ${SCRIPT_DIR}/prepareData.sh"
@@ -27,19 +42,25 @@ cd "${REPO_ROOT}"
 if [[ "${N_TRIALS}" == "-1" ]]; then
   echo "[INFO] N_TRIALS=-1 -> exhaustive grid traversal mode."
   "${PYTHON_BIN}" - <<'PY'
+import os
 from semg_mapping_stroke_scores.grid_search import search_space_summary, grid_size
 
-encoder_choices = ["tcn", "rescnn", "itransformer", "transformer", "gcn"]
+req = os.environ.get("ENCODER_CHOICES", "").strip()
+if req:
+    encoder_choices = [x.strip().lower() for x in req.split(",") if x.strip()]
+else:
+    encoder_choices = ["tcn", "rescnn", "itransformer", "transformer", "gcn"]
 from semg_mapping_stroke_scores.grid_search import check_mamba_ssm_available
 mamba_ok, mamba_reason = check_mamba_ssm_available()
-if mamba_ok:
-    encoder_choices.append("mamba")
-    encoder_choices.append("mgcn")
-else:
+if not mamba_ok and any(x in {"mamba", "mgcn"} for x in encoder_choices):
     print(
-        "[WARN] Disable encoder_type in {'mamba','mgcn'} for this run because "
+        "[WARN] Requested encoder_type in {'mamba','mgcn'} but "
         f"mamba-ssm is not usable: {mamba_reason}"
     )
+    raise SystemExit(1)
+if mamba_ok and not req:
+    encoder_choices.append("mamba")
+    encoder_choices.append("mgcn")
 
 total = grid_size(encoder_choices)
 
@@ -77,5 +98,20 @@ mkdir -p "${OUTDIR}"
   --n_val_subjects "${N_VAL_SUBJECTS}" \
   --seed "${SEED}" \
   --device "${DEVICE}" \
+  --encoder_choices "${ENCODER_CHOICES}" \
   --ssl_epochs "${SSL_EPOCHS}" \
-  --ssl_windows_per_epoch "${SSL_WINDOWS_PER_EPOCH}"
+  --ssl_windows_per_epoch "${SSL_WINDOWS_PER_EPOCH}" \
+  --ssl_use_masked_recon "${SSL_USE_MASKED_RECON}" \
+  --ssl_recon_weight "${SSL_RECON_WEIGHT}" \
+  --ssl_mask_ratio "${SSL_MASK_RATIO}" \
+  --ssl_mask_block_len "${SSL_MASK_BLOCK_LEN}" \
+  --ssl_mask_mode "${SSL_MASK_MODE}" \
+  --ssl_recon_decoder_hidden "${SSL_RECON_DECODER_HIDDEN}" \
+  --ssl_recon_loss_type "${SSL_RECON_LOSS_TYPE}" \
+  --ssl_recon_smoothl1_beta "${SSL_RECON_SMOOTHL1_BETA}" \
+  --target_mode "${TARGET_MODE}" \
+  --window_agg_mode "${WINDOW_AGG_MODE}" \
+  --window_temporal_layers "${WINDOW_TEMPORAL_LAYERS}" \
+  --window_temporal_heads "${WINDOW_TEMPORAL_HEADS}" \
+  --window_temporal_ffn_ratio "${WINDOW_TEMPORAL_FFN_RATIO}" \
+  --window_temporal_dropout "${WINDOW_TEMPORAL_DROPOUT}"

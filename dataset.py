@@ -116,11 +116,13 @@ class SessionBagDataset(Dataset):
       windows:      (A=2, R, K, C=4, Tw)
       window_mask:  (2, R, K)
       trial_mask:   (2, R)
+      window_starts:(2, R, K)  # sampled start index (in samples)
       labels: y_wh, y_se, label_mask
 
     If return_two_views=True (train for Mean-Teacher):
       windows_1, window_mask_1, trial_mask_1  (student view)
       windows_2, window_mask_2, trial_mask_2  (teacher view)
+      window_starts_1, window_starts_2
       labels: y_wh, y_se, label_mask
 
     Notes:
@@ -231,7 +233,11 @@ class SessionBagDataset(Dataset):
         self.cache.put(path, emg)
         return emg
 
-    def _sample_view(self, sess: SessionRecord, rng: np.random.RandomState) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _sample_view(
+        self,
+        sess: SessionRecord,
+        rng: np.random.RandomState,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         A = 2
         R = self.R
         K = self.K
@@ -241,6 +247,7 @@ class SessionBagDataset(Dataset):
         windows = torch.zeros((A, R, K, C, Tw), dtype=torch.float32)
         window_mask = torch.zeros((A, R, K), dtype=torch.bool)
         trial_mask = torch.zeros((A, R), dtype=torch.bool)
+        window_starts = torch.zeros((A, R, K), dtype=torch.long)
 
         axis_to_i = {"y": 0, "z": 1}
 
@@ -285,38 +292,38 @@ class SessionBagDataset(Dataset):
                 else:
                     picked = _sample_window_starts_eval(T, Tw, self.Ts, K)
 
-                ws = []
-                for st in picked:
-                    st = int(st)
-                    w = x[:, st:st + Tw]
+                ws = torch.zeros((K, C, Tw), dtype=torch.float32)
+                for k_i, st in enumerate(picked):
+                    st_i = int(st)
+                    w = x[:, st_i:st_i + Tw]
                     w = _pad_or_trim(w, Tw)
                     w = _per_window_channel_norm(w)
                     if self.supervised_aug is not None and self.mode == "train":
                         w = self.supervised_aug(w)
-                    ws.append(w)
-                ws = torch.stack(ws, dim=0)  # (K,C,Tw)
+                    ws[k_i] = w
 
                 windows[a_i, r_i] = ws
                 window_mask[a_i, r_i] = True
                 trial_mask[a_i, r_i] = True
+                window_starts[a_i, r_i] = torch.as_tensor(picked, dtype=torch.long)
 
-        return windows, window_mask, trial_mask
+        return windows, window_mask, trial_mask, window_starts
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         sess = self.sessions[idx]
 
         if self.mode == "train":
             rng1 = np.random.RandomState(np.random.randint(0, 2**31 - 1))
-            w1, wm1, tm1 = self._sample_view(sess, rng1)
+            w1, wm1, tm1, ws1 = self._sample_view(sess, rng1)
             if self.return_two_views:
                 rng2 = np.random.RandomState(np.random.randint(0, 2**31 - 1))
-                w2, wm2, tm2 = self._sample_view(sess, rng2)
+                w2, wm2, tm2, ws2 = self._sample_view(sess, rng2)
             else:
-                w2 = wm2 = tm2 = None
+                w2 = wm2 = tm2 = ws2 = None
         else:
             rng = np.random.RandomState(0)  # deterministic
-            w1, wm1, tm1 = self._sample_view(sess, rng)
-            w2 = wm2 = tm2 = None
+            w1, wm1, tm1, ws1 = self._sample_view(sess, rng)
+            w2 = wm2 = tm2 = ws2 = None
 
         labels = sess.labels
         y_wh = pd.to_numeric(labels.get("FMA_WH", np.nan), errors="coerce")
@@ -342,15 +349,18 @@ class SessionBagDataset(Dataset):
                 "windows_1": w1,
                 "window_mask_1": wm1,
                 "trial_mask_1": tm1,
+                "window_starts_1": ws1,
                 "windows_2": w2,
                 "window_mask_2": wm2,
                 "trial_mask_2": tm2,
+                "window_starts_2": ws2,
             })
         else:
             out.update({
                 "windows": w1,
                 "window_mask": wm1,
                 "trial_mask": tm1,
+                "window_starts": ws1,
             })
 
         return out

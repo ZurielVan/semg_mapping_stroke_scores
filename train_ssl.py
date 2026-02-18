@@ -13,7 +13,7 @@ import pandas as pd
 from .dataset import SSLWindowDataset
 from .augmentations import build_ssl_augmentations
 from .baseModels import build_encoder, EncoderConfig
-from .ssl_models import MoCo, MoCoConfig
+from .ssl_models import MoCo, MoCoConfig, MaskedReconConfig, MoCoWithMaskedReconstruction
 from .utils import set_seed, seed_worker, ensure_dir
 
 
@@ -37,6 +37,15 @@ class SSLTrainConfig:
 
     # MoCo
     moco: MoCoConfig = field(default_factory=MoCoConfig)
+    # optional masked reconstruction
+    ssl_use_masked_recon: bool = True
+    ssl_recon_weight: float = 0.5
+    ssl_mask_ratio: float = 0.5
+    ssl_mask_block_len: int = 16
+    ssl_mask_mode: str = "time"  # time | channel_time
+    ssl_recon_decoder_hidden: int = 256
+    ssl_recon_loss_type: str = "smoothl1"  # mse | smoothl1
+    ssl_recon_smoothl1_beta: float = 0.02
     use_cosine: bool = True
 
 
@@ -61,7 +70,12 @@ def _save_ssl_loss_plot(history_df: pd.DataFrame, out_png: str) -> None:
 
     fig, ax = plt.subplots(figsize=(8, 5))
     x = history_df["epoch"].to_numpy()
-    ax.plot(x, history_df["ssl_loss"].to_numpy(), label="ssl_loss", linewidth=2.0)
+    if "ssl_loss" in history_df.columns:
+        ax.plot(x, history_df["ssl_loss"].to_numpy(), label="ssl_loss_total", linewidth=2.0)
+    if "ssl_loss_moco" in history_df.columns:
+        ax.plot(x, history_df["ssl_loss_moco"].to_numpy(), label="ssl_loss_moco", linewidth=1.8, linestyle="--")
+    if "ssl_loss_recon" in history_df.columns:
+        ax.plot(x, history_df["ssl_loss_recon"].to_numpy(), label="ssl_loss_recon", linewidth=1.8, linestyle=":")
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Loss")
     ax.set_title("SSL Training Loss Curve")
@@ -122,7 +136,29 @@ def pretrain_ssl_moco(
     encoder_k = build_encoder(enc_cfg).to(device)
 
     moco = MoCo(encoder_q, encoder_k, emb_dim=enc_cfg.emb_dim, cfg=ssl_cfg.moco).to(device)
-    opt = torch.optim.AdamW(moco.parameters(), lr=ssl_cfg.lr, weight_decay=ssl_cfg.weight_decay)
+    recon_cfg = MaskedReconConfig(
+        enabled=bool(ssl_cfg.ssl_use_masked_recon),
+        weight=float(ssl_cfg.ssl_recon_weight),
+        mask_ratio=float(ssl_cfg.ssl_mask_ratio),
+        mask_block_len=int(ssl_cfg.ssl_mask_block_len),
+        mask_mode=str(ssl_cfg.ssl_mask_mode).strip().lower(),
+        decoder_hidden=int(ssl_cfg.ssl_recon_decoder_hidden),
+        loss_type=str(ssl_cfg.ssl_recon_loss_type).strip().lower(),
+        smoothl1_beta=float(ssl_cfg.ssl_recon_smoothl1_beta),
+    )
+    ssl_model = MoCoWithMaskedReconstruction(
+        moco=moco,
+        emb_dim=enc_cfg.emb_dim,
+        in_ch=ssl_cfg.expected_emg_ch,
+        seq_len=ssl_cfg.Tw_samples,
+        recon_cfg=recon_cfg,
+    ).to(device)
+
+    opt = torch.optim.AdamW(
+        [p for p in ssl_model.parameters() if p.requires_grad],
+        lr=ssl_cfg.lr,
+        weight_decay=ssl_cfg.weight_decay,
+    )
 
     total_steps = ssl_cfg.epochs * len(dl)
     scheduler = None
@@ -134,11 +170,16 @@ def pretrain_ssl_moco(
     loss_png_path = os.path.join(out_dir, "ssl_loss_curve.png")
     loss_history_rows = []
 
-    moco.train()
+    ssl_model.train()
     global_step = 0
     for epoch in range(ssl_cfg.epochs):
         pbar = tqdm(dl, desc=f"[SSL] epoch {epoch+1}/{ssl_cfg.epochs}", leave=False)
         ep_loss_sum = 0.0
+        ep_moco_sum = 0.0
+        ep_recon_sum = 0.0
+        ep_mask_ratio_sum = 0.0
+        ep_pos_sum = 0.0
+        ep_neg_sum = 0.0
         ep_steps = 0
         for x1, x2 in pbar:
             global_step += 1
@@ -147,9 +188,14 @@ def pretrain_ssl_moco(
 
             opt.zero_grad(set_to_none=True)
             with autocast(enabled=scaler.is_enabled()):
-                loss = moco(x1, x2)
+                loss, step_stats = ssl_model(x1, x2, return_stats=True)
             ep_steps += 1
             ep_loss_sum += float(loss.item())
+            ep_moco_sum += float(step_stats["loss_moco"])
+            ep_recon_sum += float(step_stats["loss_recon"])
+            ep_mask_ratio_sum += float(step_stats["masked_fraction"])
+            ep_pos_sum += float(step_stats["pos_sim"])
+            ep_neg_sum += float(step_stats["neg_sim"])
 
             scaler.scale(loss).backward()
             scaler.step(opt)
@@ -158,12 +204,23 @@ def pretrain_ssl_moco(
             if scheduler is not None:
                 scheduler.step()
 
-            pbar.set_postfix(loss=float(loss.item()), lr=float(opt.param_groups[0]["lr"]))
+            pbar.set_postfix(
+                loss=float(loss.item()),
+                moco=float(step_stats["loss_moco"]),
+                recon=float(step_stats["loss_recon"]),
+                mask=float(step_stats["masked_fraction"]),
+                lr=float(opt.param_groups[0]["lr"]),
+            )
 
         loss_history_rows.append(
             {
                 "epoch": int(epoch + 1),
                 "ssl_loss": _safe_mean(ep_loss_sum, ep_steps),
+                "ssl_loss_moco": _safe_mean(ep_moco_sum, ep_steps),
+                "ssl_loss_recon": _safe_mean(ep_recon_sum, ep_steps),
+                "ssl_masked_fraction": _safe_mean(ep_mask_ratio_sum, ep_steps),
+                "ssl_pos_sim": _safe_mean(ep_pos_sum, ep_steps),
+                "ssl_neg_sim": _safe_mean(ep_neg_sum, ep_steps),
                 "lr_last": float(opt.param_groups[0]["lr"]),
                 "steps": int(ep_steps),
             }
@@ -175,7 +232,7 @@ def pretrain_ssl_moco(
     ckpt_path = os.path.join(out_dir, "ssl_encoder_q.pth")
     torch.save(
         {
-            "encoder": encoder_q.state_dict(),
+            "encoder": ssl_model.moco.encoder_q.state_dict(),
             # Store plain dicts for cross-version safety.
             "encoder_cfg": asdict(enc_cfg),
             "ssl_cfg": asdict(ssl_cfg),

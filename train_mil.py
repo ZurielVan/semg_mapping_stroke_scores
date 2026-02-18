@@ -16,7 +16,6 @@ from .augmentations import build_sup_augmentations
 from .baseModels import build_encoder, EncoderConfig, HierarchicalMILRegressor
 from .loss import MainFmaLoss, ConsistencyLoss
 from .ema import clone_as_ema_teacher, update_ema_model
-from .metrics import mae, rmse, normalized_mae, within_tolerance, r2_score, correlation
 from .utils import set_seed, seed_worker, ensure_dir, to_device, torch_load_compat
 
 
@@ -47,11 +46,24 @@ class MILTrainConfig:
     # instance dropout (model-level mask dropout)
     window_dropout_p: float = 0.2
     trial_dropout_p: float = 0.1
+    # window aggregator:
+    #   set_attn: current order-invariant MIL pooling (default)
+    #   temporal_transformer: order-aware over sampled window tokens
+    window_agg_mode: str = "set_attn"
+    window_temporal_layers: int = 2
+    window_temporal_heads: int = 4
+    window_temporal_ffn_ratio: int = 2
+    window_temporal_dropout: float = 0.1
 
     # supervised loss
     huber_delta: float = 0.04
     lambda_ue: float = 0.1
     use_ue: bool = True
+    # target mode:
+    #   whse -> default current behavior (joint WH+SE, optional UE consistency)
+    #   wh   -> only optimize/evaluate WH
+    #   se   -> only optimize/evaluate SE
+    target_mode: str = "whse"
 
     # EMA (teacher weights)
     ema_decay: float = 0.999
@@ -68,6 +80,67 @@ class MILTrainConfig:
     emg_cols: Optional[list[int]] = None
     time_col: Optional[int] = 0
     expected_emg_ch: int = 4
+
+
+SUPPORTED_TARGET_MODES = {"whse", "wh", "se"}
+SUPPORTED_WINDOW_AGG_MODES = {"set_attn", "temporal_transformer"}
+
+
+def _normalize_target_mode(mode: str) -> str:
+    m = str(mode).strip().lower()
+    alias = {
+        "default": "whse",
+        "wh+se": "whse",
+        "wh_se": "whse",
+        "both": "whse",
+    }
+    m = alias.get(m, m)
+    if m not in SUPPORTED_TARGET_MODES:
+        raise ValueError(f"Unsupported target_mode={mode}. Supported: {sorted(SUPPORTED_TARGET_MODES)}")
+    return m
+
+
+def _use_wh(mode: str) -> bool:
+    return mode in {"whse", "wh"}
+
+
+def _use_se(mode: str) -> bool:
+    return mode in {"whse", "se"}
+
+
+def _apply_target_label_mask(label_mask: torch.Tensor, target_mode: str) -> torch.Tensor:
+    out = label_mask.clone()
+    if not _use_wh(target_mode):
+        out[:, 0] = False
+    if not _use_se(target_mode):
+        out[:, 1] = False
+    return out
+
+
+def _consistency_tensor(yhat_wh: torch.Tensor, yhat_se: torch.Tensor, target_mode: str) -> torch.Tensor:
+    if target_mode == "wh":
+        return (yhat_wh / 24.0).unsqueeze(1)
+    if target_mode == "se":
+        return (yhat_se / 42.0).unsqueeze(1)
+    return torch.stack([yhat_wh / 24.0, yhat_se / 42.0], dim=1)
+
+
+def _normalize_window_agg_mode(mode: str) -> str:
+    m = str(mode).strip().lower()
+    alias = {
+        "default": "set_attn",
+        "set": "set_attn",
+        "attn": "set_attn",
+        "temporal": "temporal_transformer",
+        "temporal_attn": "temporal_transformer",
+    }
+    m = alias.get(m, m)
+    if m not in SUPPORTED_WINDOW_AGG_MODES:
+        raise ValueError(
+            f"Unsupported window_agg_mode={mode}. "
+            f"Supported: {sorted(SUPPORTED_WINDOW_AGG_MODES)}"
+        )
+    return m
 
 
 def _sigmoid_rampup(current: int, rampup_length: int) -> float:
@@ -198,7 +271,7 @@ def _save_loss_plot(history_df: pd.DataFrame, out_png: str) -> None:
         )
 
     for col in history_df.columns:
-        if col.startswith("val_"):
+        if col.startswith("val_") and col != "val_score":
             _plot_val_metric(col, col[4:])
     if "val_score" in history_df.columns:
         _plot_val_metric("val_score", "score")
@@ -218,52 +291,143 @@ def _save_loss_plot(history_df: pd.DataFrame, out_png: str) -> None:
     plt.close(fig)
 
 
+class _RunningRegressionStats:
+    """
+    Streaming regression statistics (O(1) memory).
+    """
+    def __init__(self):
+        self.n = 0
+        self.sum_abs = 0.0
+        self.sum_sq = 0.0
+        self.sum_y = 0.0
+        self.sum_y2 = 0.0
+        self.sum_yhat = 0.0
+        self.sum_yhat2 = 0.0
+        self.sum_yyhat = 0.0
+        self.cnt_within1 = 0
+        self.cnt_within2 = 0
+
+    def update(self, y: torch.Tensor, yhat: torch.Tensor, tol1: Optional[float] = None, tol2: Optional[float] = None) -> None:
+        if y.numel() == 0:
+            return
+        y = y.detach().double().view(-1)
+        yhat = yhat.detach().double().view(-1)
+        err = y - yhat
+
+        n = int(y.numel())
+        self.n += n
+        self.sum_abs += float(torch.abs(err).sum().item())
+        self.sum_sq += float(torch.square(err).sum().item())
+        self.sum_y += float(y.sum().item())
+        self.sum_y2 += float(torch.square(y).sum().item())
+        self.sum_yhat += float(yhat.sum().item())
+        self.sum_yhat2 += float(torch.square(yhat).sum().item())
+        self.sum_yyhat += float((y * yhat).sum().item())
+        if tol1 is not None:
+            self.cnt_within1 += int((torch.abs(err) <= float(tol1)).sum().item())
+        if tol2 is not None:
+            self.cnt_within2 += int((torch.abs(err) <= float(tol2)).sum().item())
+
+    def mae(self) -> float:
+        if self.n == 0:
+            return float("nan")
+        return float(self.sum_abs / self.n)
+
+    def rmse(self) -> float:
+        if self.n == 0:
+            return float("nan")
+        return float(math.sqrt(self.sum_sq / self.n))
+
+    def r2(self) -> float:
+        if self.n == 0:
+            return float("nan")
+        ss_tot = self.sum_y2 - (self.sum_y * self.sum_y / self.n)
+        if ss_tot <= 1e-12:
+            return 1.0 if self.sum_sq <= 1e-12 else 0.0
+        return float(1.0 - (self.sum_sq / ss_tot))
+
+    def corr(self) -> float:
+        if self.n < 2:
+            return 0.0
+        var_y = self.sum_y2 - (self.sum_y * self.sum_y / self.n)
+        var_yhat = self.sum_yhat2 - (self.sum_yhat * self.sum_yhat / self.n)
+        if var_y <= 1e-12 or var_yhat <= 1e-12:
+            return 0.0
+        cov = self.sum_yyhat - (self.sum_y * self.sum_yhat / self.n)
+        corr = cov / math.sqrt(var_y * var_yhat)
+        return float(max(-1.0, min(1.0, corr)))
+
+    def within1(self) -> float:
+        if self.n == 0:
+            return float("nan")
+        return float(self.cnt_within1 / self.n)
+
+    def within2(self) -> float:
+        if self.n == 0:
+            return float("nan")
+        return float(self.cnt_within2 / self.n)
+
+    def nmae(self, scale: float) -> float:
+        if self.n == 0:
+            return float("nan")
+        return float((self.sum_abs / self.n) / float(scale))
+
+
 @torch.no_grad()
-def evaluate_mil(model, dl, device) -> Dict[str, float]:
+def evaluate_mil(model, dl, device, target_mode: str = "whse") -> Dict[str, float]:
+    target_mode = _normalize_target_mode(target_mode)
     model.eval()
-    ys_wh, ys_se, yh_wh, yh_se = [], [], [], []
+
+    wh_stats = _RunningRegressionStats()
+    se_stats = _RunningRegressionStats()
+    ue_stats = _RunningRegressionStats()
 
     for batch in dl:
         batch = to_device(batch, device)
         windows = batch["windows"]
         window_mask = batch["window_mask"]
         trial_mask = batch["trial_mask"]
+        window_starts = batch.get("window_starts")
         y_wh = batch["y_wh"]
         y_se = batch["y_se"]
         label_mask = batch["label_mask"]
 
-        yhat_wh, yhat_se = model(windows, window_mask, trial_mask)
+        yhat_wh, yhat_se = model(windows, window_mask, trial_mask, window_starts=window_starts)
 
-        m_wh = label_mask[:, 0]
-        m_se = label_mask[:, 1]
-        if m_wh.any():
-            ys_wh.append(y_wh[m_wh].detach().cpu())
-            yh_wh.append(yhat_wh[m_wh].detach().cpu())
-        if m_se.any():
-            ys_se.append(y_se[m_se].detach().cpu())
-            yh_se.append(yhat_se[m_se].detach().cpu())
+        m_wh = label_mask[:, 0] & _use_wh(target_mode)
+        m_se = label_mask[:, 1] & _use_se(target_mode)
+        if bool(m_wh.any()):
+            wh_stats.update(y_wh[m_wh], yhat_wh[m_wh], tol1=1.0, tol2=2.0)
+        if bool(m_se.any()):
+            se_stats.update(y_se[m_se], yhat_se[m_se], tol1=1.0, tol2=2.0)
 
-    if len(ys_wh) == 0 or len(ys_se) == 0:
+        m_ue = m_wh & m_se
+        if bool(m_ue.any()):
+            ue_stats.update(y_wh[m_ue] + y_se[m_ue], yhat_wh[m_ue] + yhat_se[m_ue])
+
+    if _use_wh(target_mode) and wh_stats.n == 0:
+        return {"val_score": float("inf")}
+    if _use_se(target_mode) and se_stats.n == 0:
         return {"val_score": float("inf")}
 
-    ys_wh = torch.cat(ys_wh)
-    yh_wh = torch.cat(yh_wh)
-    ys_se = torch.cat(ys_se)
-    yh_se = torch.cat(yh_se)
+    mae_wh = wh_stats.mae() if wh_stats.n > 0 else float("nan")
+    mae_se = se_stats.mae() if se_stats.n > 0 else float("nan")
+    mae_ue = ue_stats.mae() if ue_stats.n > 0 else float("nan")
+    r2_wh = wh_stats.r2() if wh_stats.n > 0 else float("nan")
+    r2_se = se_stats.r2() if se_stats.n > 0 else float("nan")
+    r2_ue = ue_stats.r2() if ue_stats.n > 0 else float("nan")
+    corr_wh = wh_stats.corr() if wh_stats.n > 0 else float("nan")
+    corr_se = se_stats.corr() if se_stats.n > 0 else float("nan")
+    corr_ue = ue_stats.corr() if ue_stats.n > 0 else float("nan")
 
-    mae_wh = mae(ys_wh, yh_wh)
-    mae_se = mae(ys_se, yh_se)
-    mae_ue = mae(ys_wh + ys_se, yh_wh + yh_se)
-    r2_wh = r2_score(ys_wh, yh_wh)
-    r2_se = r2_score(ys_se, yh_se)
-    r2_ue = r2_score(ys_wh + ys_se, yh_wh + yh_se)
-    corr_wh = correlation(ys_wh, yh_wh)
-    corr_se = correlation(ys_se, yh_se)
-    corr_ue = correlation(ys_wh + ys_se, yh_wh + yh_se)
-
-    nmae_wh = normalized_mae(ys_wh, yh_wh, 24.0)
-    nmae_se = normalized_mae(ys_se, yh_se, 42.0)
-    val_score = 0.5 * (nmae_wh + nmae_se)
+    nmae_wh = wh_stats.nmae(24.0) if wh_stats.n > 0 else float("nan")
+    nmae_se = se_stats.nmae(42.0) if se_stats.n > 0 else float("nan")
+    if target_mode == "wh":
+        val_score = nmae_wh
+    elif target_mode == "se":
+        val_score = nmae_se
+    else:
+        val_score = 0.5 * (nmae_wh + nmae_se)
 
     return {
         "MAE_WH": mae_wh,
@@ -275,12 +439,12 @@ def evaluate_mil(model, dl, device) -> Dict[str, float]:
         "Corr_WH": corr_wh,
         "Corr_SE": corr_se,
         "Corr_UE": corr_ue,
-        "RMSE_WH": rmse(ys_wh, yh_wh),
-        "RMSE_SE": rmse(ys_se, yh_se),
-        "within1_WH": within_tolerance(ys_wh, yh_wh, tol=1.0),
-        "within2_WH": within_tolerance(ys_wh, yh_wh, tol=2.0),
-        "within1_SE": within_tolerance(ys_se, yh_se, tol=1.0),
-        "within2_SE": within_tolerance(ys_se, yh_se, tol=2.0),
+        "RMSE_WH": wh_stats.rmse() if wh_stats.n > 0 else float("nan"),
+        "RMSE_SE": se_stats.rmse() if se_stats.n > 0 else float("nan"),
+        "within1_WH": wh_stats.within1() if wh_stats.n > 0 else float("nan"),
+        "within2_WH": wh_stats.within2() if wh_stats.n > 0 else float("nan"),
+        "within1_SE": se_stats.within1() if se_stats.n > 0 else float("nan"),
+        "within2_SE": se_stats.within2() if se_stats.n > 0 else float("nan"),
         "val_score": val_score,
     }
 
@@ -308,6 +472,9 @@ def train_mil_supervised(
     """
     ensure_dir(out_dir)
     set_seed(mil_cfg.seed)
+    target_mode = _normalize_target_mode(mil_cfg.target_mode)
+    window_agg_mode = _normalize_window_agg_mode(mil_cfg.window_agg_mode)
+    mil_cfg = replace(mil_cfg, target_mode=target_mode, window_agg_mode=window_agg_mode)
 
     sup_aug = build_sup_augmentations(mil_cfg.sup_aug_strength)
     return_two_views = mil_cfg.use_mean_teacher and mil_cfg.consistency_weight > 0.0
@@ -320,6 +487,7 @@ def train_mil_supervised(
         mode="train",
         supervised_aug=sup_aug,
         return_two_views=return_two_views,
+        require_both_main_labels=(target_mode == "whse"),
         emg_cols=mil_cfg.emg_cols,
         time_col=mil_cfg.time_col,
         expected_emg_ch=mil_cfg.expected_emg_ch,
@@ -333,6 +501,7 @@ def train_mil_supervised(
         mode="val",
         supervised_aug=None,
         return_two_views=False,
+        require_both_main_labels=(target_mode == "whse"),
         emg_cols=mil_cfg.emg_cols,
         time_col=mil_cfg.time_col,
         expected_emg_ch=mil_cfg.expected_emg_ch,
@@ -359,9 +528,13 @@ def train_mil_supervised(
         enc_cfg = replace(encoder_cfg, mgcn_seq_len=mil_cfg.Tw_samples)
 
     encoder = build_encoder(enc_cfg).to(device)
-    if ssl_encoder_ckpt is not None and os.path.exists(ssl_encoder_ckpt):
-        ckpt = torch_load_compat(ssl_encoder_ckpt, map_location="cpu")
-        encoder.load_state_dict(ckpt["encoder"], strict=True)
+    if ssl_encoder_ckpt is not None:
+        if os.path.exists(ssl_encoder_ckpt):
+            ckpt = torch_load_compat(ssl_encoder_ckpt, map_location="cpu")
+            encoder.load_state_dict(ckpt["encoder"], strict=True)
+            print(f"[INFO] MIL encoder initialized from SSL checkpoint: {ssl_encoder_ckpt}")
+        else:
+            print(f"[WARN] SSL checkpoint not found, MIL encoder uses random init: {ssl_encoder_ckpt}")
 
     student = HierarchicalMILRegressor(
         encoder=encoder,
@@ -371,6 +544,11 @@ def train_mil_supervised(
         dropout=mil_cfg.dropout,
         window_dropout_p=mil_cfg.window_dropout_p,
         trial_dropout_p=mil_cfg.trial_dropout_p,
+        window_agg_mode=mil_cfg.window_agg_mode,
+        window_temporal_layers=mil_cfg.window_temporal_layers,
+        window_temporal_heads=mil_cfg.window_temporal_heads,
+        window_temporal_ffn_ratio=mil_cfg.window_temporal_ffn_ratio,
+        window_temporal_dropout=mil_cfg.window_temporal_dropout,
     ).to(device)
 
     teacher = clone_as_ema_teacher(student).to(device)
@@ -436,28 +614,32 @@ def train_mil_supervised(
                 w1 = batch["windows_1"]
                 wm1 = batch["window_mask_1"]
                 tm1 = batch["trial_mask_1"]
+                ws1 = batch.get("window_starts_1")
                 w2 = batch["windows_2"]
                 wm2 = batch["window_mask_2"]
                 tm2 = batch["trial_mask_2"]
+                ws2 = batch.get("window_starts_2")
             else:
                 w1 = batch["windows"]
                 wm1 = batch["window_mask"]
                 tm1 = batch["trial_mask"]
-                w2 = wm2 = tm2 = None
+                ws1 = batch.get("window_starts")
+                w2 = wm2 = tm2 = ws2 = None
 
             y_wh = batch["y_wh"]
             y_se = batch["y_se"]
             label_mask = batch["label_mask"]  # (B,2)
+            label_mask_eff = _apply_target_label_mask(label_mask, target_mode)
 
             opt.zero_grad(set_to_none=True)
 
             with autocast(enabled=scaler.is_enabled()):
                 # student forward
-                yhat_wh_s, yhat_se_s = student(w1, wm1, tm1)
-                L_sup = sup_loss_fn(y_wh, y_se, yhat_wh_s, yhat_se_s, label_mask)
+                yhat_wh_s, yhat_se_s = student(w1, wm1, tm1, window_starts=ws1)
+                L_sup = sup_loss_fn(y_wh, y_se, yhat_wh_s, yhat_se_s, label_mask_eff)
 
-                wh_mask = label_mask[:, 0]
-                se_mask = label_mask[:, 1]
+                wh_mask = label_mask_eff[:, 0]
+                se_mask = label_mask_eff[:, 1]
                 L_wh = None
                 L_se = None
                 if wh_mask.any():
@@ -469,10 +651,10 @@ def train_mil_supervised(
                 if return_two_views and mil_cfg.consistency_weight > 0.0:
                     with torch.no_grad():
                         teacher.eval()
-                        yhat_wh_t, yhat_se_t = teacher(w2, wm2, tm2)
+                        yhat_wh_t, yhat_se_t = teacher(w2, wm2, tm2, window_starts=ws2)
 
-                    p_s = torch.stack([yhat_wh_s / 24.0, yhat_se_s / 42.0], dim=1)
-                    p_t = torch.stack([yhat_wh_t / 24.0, yhat_se_t / 42.0], dim=1)
+                    p_s = _consistency_tensor(yhat_wh_s, yhat_se_s, target_mode)
+                    p_t = _consistency_tensor(yhat_wh_t, yhat_se_t, target_mode)
                     L_cons = cons_loss_fn(p_s, p_t)
 
                 w_cons = mil_cfg.consistency_weight * ramp if (return_two_views and mil_cfg.use_mean_teacher) else 0.0
@@ -512,7 +694,7 @@ def train_mil_supervised(
             )
 
         # Validation using teacher weights (EMA) for stability
-        val_metrics = evaluate_mil(teacher, dl_val, device)
+        val_metrics = evaluate_mil(teacher, dl_val, device, target_mode=target_mode)
         val_score = float(val_metrics["val_score"])
 
         epoch_row = {

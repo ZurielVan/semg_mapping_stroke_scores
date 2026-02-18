@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import itertools
+import json
 import os
 from typing import Dict, Any, Optional
 
@@ -23,6 +24,55 @@ def parse_int_list(s: Optional[str]) -> Optional[list[int]]:
     if s is None or s.strip() == "":
         return None
     return [int(x) for x in s.split(",")]
+
+
+def parse_str_list(s: Optional[str]) -> Optional[list[str]]:
+    if s is None:
+        return None
+    vals = [x.strip() for x in s.split(",") if x.strip()]
+    if len(vals) == 0:
+        return None
+    return vals
+
+
+def parse_bool_flag(v: str) -> bool:
+    s = str(v).strip().lower()
+    if s in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if s in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise ValueError(f"Cannot parse bool flag from: {v}")
+
+
+def load_trial_grid_json(path: str) -> list[Dict[str, Any]]:
+    with open(path, "r", encoding="utf-8") as f:
+        obj = json.load(f)
+    if not isinstance(obj, list):
+        raise ValueError(f"trial_grid_json must be a JSON list, got {type(obj)}")
+    if len(obj) == 0:
+        raise ValueError("trial_grid_json is empty.")
+
+    valid_param_keys = set(PARAM_CANDIDATES.keys())
+    out: list[Dict[str, Any]] = []
+    for i, row in enumerate(obj):
+        if not isinstance(row, dict):
+            raise ValueError(f"trial_grid_json[{i}] must be an object, got {type(row)}")
+
+        et = str(row.get("encoder_type", "itransformer")).strip().lower()
+        if et not in MODEL_PARAM_NAMES:
+            raise ValueError(f"trial_grid_json[{i}] has unknown encoder_type={et}")
+
+        unknown = [k for k in row.keys() if k not in valid_param_keys and k != "encoder_type" and k != "Ts_samples"]
+        if len(unknown) > 0:
+            raise ValueError(
+                f"trial_grid_json[{i}] has unknown keys: {unknown}. "
+                f"Allowed: {sorted(list(valid_param_keys) + ['encoder_type'])}"
+            )
+
+        selected = {k: v for k, v in row.items() if k in valid_param_keys}
+        out.append(build_hparams_for_encoder(et, selected))
+
+    return out
 
 
 HPARAM_ORDER = [
@@ -361,6 +411,37 @@ def to_mil_cfg(obj: Any) -> MILTrainConfig:
     raise TypeError(f"Unsupported mil_cfg type: {type(obj)}")
 
 
+def normalize_target_mode(mode: str) -> str:
+    m = str(mode).strip().lower()
+    alias = {
+        "default": "whse",
+        "wh+se": "whse",
+        "wh_se": "whse",
+        "both": "whse",
+    }
+    m = alias.get(m, m)
+    supported = {"whse", "wh", "se"}
+    if m not in supported:
+        raise ValueError(f"Unsupported target_mode={mode}. Supported: {sorted(supported)}")
+    return m
+
+
+def normalize_window_agg_mode(mode: str) -> str:
+    m = str(mode).strip().lower()
+    alias = {
+        "default": "set_attn",
+        "set": "set_attn",
+        "attn": "set_attn",
+        "temporal": "temporal_transformer",
+        "temporal_attn": "temporal_transformer",
+    }
+    m = alias.get(m, m)
+    supported = {"set_attn", "temporal_transformer"}
+    if m not in supported:
+        raise ValueError(f"Unsupported window_agg_mode={mode}. Supported: {sorted(supported)}")
+    return m
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--manifest_csv", type=str, required=True)
@@ -371,30 +452,85 @@ def main():
     ap.add_argument("--n_val_subjects", type=int, default=2)
     ap.add_argument("--seed", type=int, default=2026)
     ap.add_argument("--device", type=str, default="cuda")
+    ap.add_argument(
+        "--trial_grid_json",
+        type=str,
+        default="",
+        help="optional JSON list of preset trial hparams; when set, search mode becomes preset",
+    )
 
     ap.add_argument("--emg_cols", type=str, default="", help="comma-separated indices for EMG columns when reading .lvm (default auto)")
     ap.add_argument("--time_col", type=int, default=0)
     ap.add_argument("--expected_emg_ch", type=int, default=4)
+    ap.add_argument(
+        "--encoder_choices",
+        type=str,
+        default="",
+        help="comma-separated encoder types to include in search (default: all available)",
+    )
 
     ap.add_argument("--ssl_epochs", type=int, default=100)
     ap.add_argument("--ssl_windows_per_epoch", type=int, default=20000)
+    ap.add_argument("--ssl_use_masked_recon", type=str, default="true")
+    ap.add_argument("--ssl_recon_weight", type=float, default=0.5)
+    ap.add_argument("--ssl_mask_ratio", type=float, default=0.5)
+    ap.add_argument("--ssl_mask_block_len", type=int, default=16)
+    ap.add_argument("--ssl_mask_mode", type=str, default="time", help="time | channel_time")
+    ap.add_argument("--ssl_recon_decoder_hidden", type=int, default=256)
+    ap.add_argument("--ssl_recon_loss_type", type=str, default="smoothl1", help="mse | smoothl1")
+    ap.add_argument("--ssl_recon_smoothl1_beta", type=float, default=0.02)
+    ap.add_argument(
+        "--target_mode",
+        type=str,
+        default="whse",
+        help="MIL supervised target mode: whse (default), wh, se",
+    )
+    ap.add_argument(
+        "--window_agg_mode",
+        type=str,
+        default="set_attn",
+        help="window aggregator: set_attn (default) | temporal_transformer",
+    )
+    ap.add_argument("--window_temporal_layers", type=int, default=2)
+    ap.add_argument("--window_temporal_heads", type=int, default=4)
+    ap.add_argument("--window_temporal_ffn_ratio", type=int, default=2)
+    ap.add_argument("--window_temporal_dropout", type=float, default=0.1)
     args = ap.parse_args()
-    if args.n_trials == 0 or args.n_trials < -1:
+    trial_grid_json = str(args.trial_grid_json).strip()
+    if trial_grid_json == "" and (args.n_trials == 0 or args.n_trials < -1):
         raise ValueError("n_trials must be > 0 for random search, or -1 for exhaustive grid search.")
 
     ensure_dir(args.outdir)
     set_seed(args.seed)
+    target_mode = normalize_target_mode(args.target_mode)
+    window_agg_mode = normalize_window_agg_mode(args.window_agg_mode)
+    ssl_use_masked_recon = parse_bool_flag(args.ssl_use_masked_recon)
     device = torch.device(args.device if (torch.cuda.is_available() and args.device.startswith("cuda")) else "cpu")
-    encoder_choices = ["tcn", "rescnn", "itransformer", "transformer", "gcn"]
+    default_encoder_choices = ["tcn", "rescnn", "itransformer", "transformer", "gcn"]
     mamba_ok, mamba_reason = check_mamba_ssm_available()
     if mamba_ok:
-        encoder_choices.append("mamba")
-        encoder_choices.append("mgcn")
+        default_encoder_choices.append("mamba")
+        default_encoder_choices.append("mgcn")
     else:
         print(
             "[WARN] Disable encoder_type in {'mamba','mgcn'} for this run because "
             f"mamba-ssm is not usable: {mamba_reason}"
         )
+
+    req_encoder_choices = parse_str_list(args.encoder_choices)
+    if req_encoder_choices is None:
+        encoder_choices = default_encoder_choices
+    else:
+        req_norm = [str(e).strip().lower() for e in req_encoder_choices]
+        allowed = set(default_encoder_choices)
+        unknown = [e for e in req_norm if e not in allowed]
+        if len(unknown) > 0:
+            raise ValueError(
+                f"Unsupported/Unavailable encoder choices: {unknown}. "
+                f"Available: {sorted(allowed)}"
+            )
+        encoder_choices = req_norm
+
     print(f"[INFO] Encoder search space: {encoder_choices}")
     summaries = search_space_summary(encoder_choices)
     total_effective = 0
@@ -407,8 +543,21 @@ def main():
             vals_text = ", ".join(str(v) for v in vals)
             print(f"  - {k} ({len(vals)}): {vals_text}")
     print(f"[INFO] Total effective combinations per fold: {total_effective}")
-    search_mode = "grid" if args.n_trials == -1 else "random"
+    preset_trials: Optional[list[Dict[str, Any]]] = None
+    if trial_grid_json != "":
+        search_mode = "preset"
+    else:
+        search_mode = "grid" if args.n_trials == -1 else "random"
     print(f"[INFO] Search mode: {search_mode}")
+    print(f"[INFO] Target mode: {target_mode}")
+    print(f"[INFO] Window aggregator: {window_agg_mode}")
+    print(
+        "[INFO] SSL masked recon: "
+        f"enabled={ssl_use_masked_recon}, weight={args.ssl_recon_weight}, "
+        f"mask_ratio={args.ssl_mask_ratio}, block_len={args.ssl_mask_block_len}, "
+        f"mask_mode={args.ssl_mask_mode}, decoder_hidden={args.ssl_recon_decoder_hidden}, "
+        f"loss={args.ssl_recon_loss_type}, beta={args.ssl_recon_smoothl1_beta}"
+    )
     if search_mode == "grid":
         total_grid = grid_size(encoder_choices)
         print(f"[INFO] Grid size per fold: {total_grid}")
@@ -417,6 +566,11 @@ def main():
                 "[WARN] Grid size is very large. This run may take a very long time. "
                 "Use N_TRIALS>0 for random search if needed."
             )
+    elif search_mode == "preset":
+        if not os.path.exists(trial_grid_json):
+            raise FileNotFoundError(f"trial_grid_json not found: {trial_grid_json}")
+        preset_trials = load_trial_grid_json(trial_grid_json)
+        print(f"[INFO] Loaded preset trial grid: {trial_grid_json} (n={len(preset_trials)})")
 
     manifest_df = pd.read_csv(args.manifest_csv)
     labels_df = pd.read_csv(args.labels_csv)
@@ -437,7 +591,26 @@ def main():
         os.remove(trial_summary_csv_path)
 
     trial_summary_fields = (
-        ["trial_id", "search_mode", "n_folds", "mean_fold_val_score"]
+        [
+            "trial_id",
+            "search_mode",
+            "target_mode",
+            "window_agg_mode",
+            "window_temporal_layers",
+            "window_temporal_heads",
+            "window_temporal_ffn_ratio",
+            "window_temporal_dropout",
+            "ssl_use_masked_recon",
+            "ssl_recon_weight",
+            "ssl_mask_ratio",
+            "ssl_mask_block_len",
+            "ssl_mask_mode",
+            "ssl_recon_decoder_hidden",
+            "ssl_recon_loss_type",
+            "ssl_recon_smoothl1_beta",
+            "n_folds",
+            "mean_fold_val_score",
+        ]
         + [f"mean_test_{k}" for k in TEST_METRIC_KEYS]
         + HPARAM_ORDER
     )
@@ -477,11 +650,29 @@ def main():
             "val_subjects": [str(s) for s in val_subjects],
             "inner_train_subjects": [str(s) for s in inner_train],
             "search_mode": search_mode,
+            "target_mode": target_mode,
+            "window_agg_mode": window_agg_mode,
+            "window_temporal_layers": int(args.window_temporal_layers),
+            "window_temporal_heads": int(args.window_temporal_heads),
+            "window_temporal_ffn_ratio": int(args.window_temporal_ffn_ratio),
+            "window_temporal_dropout": float(args.window_temporal_dropout),
+            "ssl_use_masked_recon": bool(ssl_use_masked_recon),
+            "ssl_recon_weight": float(args.ssl_recon_weight),
+            "ssl_mask_ratio": float(args.ssl_mask_ratio),
+            "ssl_mask_block_len": int(args.ssl_mask_block_len),
+            "ssl_mask_mode": str(args.ssl_mask_mode).strip().lower(),
+            "ssl_recon_decoder_hidden": int(args.ssl_recon_decoder_hidden),
+            "ssl_recon_loss_type": str(args.ssl_recon_loss_type).strip().lower(),
+            "ssl_recon_smoothl1_beta": float(args.ssl_recon_smoothl1_beta),
             "trials": [],
         }
 
     if search_mode == "grid":
         trial_iter = enumerate(iter_grid_hparams(encoder_choices))
+    elif search_mode == "preset":
+        if preset_trials is None:
+            raise RuntimeError("Internal error: preset trial grid was not loaded.")
+        trial_iter = enumerate(preset_trials)
     else:
         rng = np.random.RandomState(args.seed + 1000)
         fixed_trials = sample_unique_hparams(rng, encoder_choices, args.n_trials)
@@ -528,6 +719,14 @@ def main():
                     lr=3e-4,
                     weight_decay=1e-3,
                     aug_strength="medium",
+                    ssl_use_masked_recon=bool(ssl_use_masked_recon),
+                    ssl_recon_weight=float(args.ssl_recon_weight),
+                    ssl_mask_ratio=float(args.ssl_mask_ratio),
+                    ssl_mask_block_len=int(args.ssl_mask_block_len),
+                    ssl_mask_mode=str(args.ssl_mask_mode).strip().lower(),
+                    ssl_recon_decoder_hidden=int(args.ssl_recon_decoder_hidden),
+                    ssl_recon_loss_type=str(args.ssl_recon_loss_type).strip().lower(),
+                    ssl_recon_smoothl1_beta=float(args.ssl_recon_smoothl1_beta),
                     emg_cols=emg_cols,
                     time_col=args.time_col,
                     expected_emg_ch=args.expected_emg_ch,
@@ -558,6 +757,12 @@ def main():
                     consistency_rampup_epochs=hps["consistency_rampup_epochs"],
                     consistency_loss_type=hps["consistency_loss_type"],
                     sup_aug_strength="weak",
+                    target_mode=target_mode,
+                    window_agg_mode=window_agg_mode,
+                    window_temporal_layers=int(args.window_temporal_layers),
+                    window_temporal_heads=int(args.window_temporal_heads),
+                    window_temporal_ffn_ratio=int(args.window_temporal_ffn_ratio),
+                    window_temporal_dropout=float(args.window_temporal_dropout),
                     emg_cols=emg_cols,
                     time_col=args.time_col,
                     expected_emg_ch=args.expected_emg_ch,
@@ -601,6 +806,7 @@ def main():
                     mode="test",
                     supervised_aug=None,
                     return_two_views=False,
+                    require_both_main_labels=(normalize_target_mode(mil_cfg_best.target_mode) == "whse"),
                     emg_cols=mil_cfg_best.emg_cols,
                     time_col=mil_cfg_best.time_col,
                     expected_emg_ch=mil_cfg_best.expected_emg_ch,
@@ -623,9 +829,19 @@ def main():
                     dropout=mil_cfg_best.dropout,
                     window_dropout_p=0.0,
                     trial_dropout_p=0.0,
+                    window_agg_mode=normalize_window_agg_mode(mil_cfg_best.window_agg_mode),
+                    window_temporal_layers=mil_cfg_best.window_temporal_layers,
+                    window_temporal_heads=mil_cfg_best.window_temporal_heads,
+                    window_temporal_ffn_ratio=mil_cfg_best.window_temporal_ffn_ratio,
+                    window_temporal_dropout=mil_cfg_best.window_temporal_dropout,
                 ).to(device)
                 teacher.load_state_dict(ckpt["teacher"], strict=True)
-                test_metrics = evaluate_mil(teacher, test_dl, device)
+                test_metrics = evaluate_mil(
+                    teacher,
+                    test_dl,
+                    device,
+                    target_mode=normalize_target_mode(mil_cfg_best.target_mode),
+                )
                 trial_fold_tests.append(test_metrics)
 
                 split_info = dict(ckpt.get("split_info", {}))
@@ -633,6 +849,12 @@ def main():
                     {
                         "trial_id": int(t),
                         "fold_id": fold_id,
+                        "target_mode": normalize_target_mode(mil_cfg_best.target_mode),
+                        "window_agg_mode": normalize_window_agg_mode(mil_cfg_best.window_agg_mode),
+                        "window_temporal_layers": int(mil_cfg_best.window_temporal_layers),
+                        "window_temporal_heads": int(mil_cfg_best.window_temporal_heads),
+                        "window_temporal_ffn_ratio": int(mil_cfg_best.window_temporal_ffn_ratio),
+                        "window_temporal_dropout": float(mil_cfg_best.window_temporal_dropout),
                         "test_subject": str(test_subject),
                         "val_subjects": [str(s) for s in val_subjects],
                         "train_subjects": [str(s) for s in inner_train],
@@ -660,6 +882,20 @@ def main():
             trial_row: Dict[str, Any] = {
                 "trial_id": int(t),
                 "search_mode": search_mode,
+                "target_mode": target_mode,
+                "window_agg_mode": window_agg_mode,
+                "window_temporal_layers": int(args.window_temporal_layers),
+                "window_temporal_heads": int(args.window_temporal_heads),
+                "window_temporal_ffn_ratio": int(args.window_temporal_ffn_ratio),
+                "window_temporal_dropout": float(args.window_temporal_dropout),
+                "ssl_use_masked_recon": bool(ssl_use_masked_recon),
+                "ssl_recon_weight": float(args.ssl_recon_weight),
+                "ssl_mask_ratio": float(args.ssl_mask_ratio),
+                "ssl_mask_block_len": int(args.ssl_mask_block_len),
+                "ssl_mask_mode": str(args.ssl_mask_mode).strip().lower(),
+                "ssl_recon_decoder_hidden": int(args.ssl_recon_decoder_hidden),
+                "ssl_recon_loss_type": str(args.ssl_recon_loss_type).strip().lower(),
+                "ssl_recon_smoothl1_beta": float(args.ssl_recon_smoothl1_beta),
                 "n_folds": len(trial_fold_tests),
                 "mean_fold_val_score": mean_numeric(trial_fold_vals, default=float("inf")),
             }
@@ -702,6 +938,20 @@ def main():
             append_jsonl(summary_path, {
                 "fold_id": fold_id,
                 "test_subject": fold_record["test_subject"],
+                "target_mode": target_mode,
+                "window_agg_mode": window_agg_mode,
+                "window_temporal_layers": int(args.window_temporal_layers),
+                "window_temporal_heads": int(args.window_temporal_heads),
+                "window_temporal_ffn_ratio": int(args.window_temporal_ffn_ratio),
+                "window_temporal_dropout": float(args.window_temporal_dropout),
+                "ssl_use_masked_recon": bool(ssl_use_masked_recon),
+                "ssl_recon_weight": float(args.ssl_recon_weight),
+                "ssl_mask_ratio": float(args.ssl_mask_ratio),
+                "ssl_mask_block_len": int(args.ssl_mask_block_len),
+                "ssl_mask_mode": str(args.ssl_mask_mode).strip().lower(),
+                "ssl_recon_decoder_hidden": int(args.ssl_recon_decoder_hidden),
+                "ssl_recon_loss_type": str(args.ssl_recon_loss_type).strip().lower(),
+                "ssl_recon_smoothl1_beta": float(args.ssl_recon_smoothl1_beta),
                 "best_val": fold_record["best"]["best_val"],
                 "test_metrics": fold_record["best"]["test_metrics"],
                 "best_hparams": fold_record["best"]["best_hparams"],
