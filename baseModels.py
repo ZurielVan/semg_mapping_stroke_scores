@@ -346,6 +346,8 @@ class TemporalWindowAggregator(nn.Module):
             if self.temporal is not None:
                 x_valid = self.temporal(x_valid, src_key_padding_mask=~mask_valid)
             x_valid = self.norm(x_valid)
+            if x_valid.dtype != out.dtype:
+                x_valid = x_valid.to(dtype=out.dtype)
             out[row_has_valid] = x_valid
 
         out = torch.where(mask.unsqueeze(-1), out, torch.zeros_like(out))
