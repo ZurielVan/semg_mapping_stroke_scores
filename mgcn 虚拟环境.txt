@@ -1,0 +1,3 @@
+安装 setup_mgcn_gpu_env.sh
+运行 wsl -e bash -lc 'source .venv310/bin/activate && ENCODER_CHOICES=mgcn bash semg_mapping_stroke_scores/exp_v1_loso.sh'
+
