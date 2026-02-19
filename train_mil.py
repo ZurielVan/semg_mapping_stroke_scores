@@ -157,6 +157,15 @@ def _safe_mean(total: float, count: int) -> float:
     return float(total / count)
 
 
+def _all_finite_tensors(*vals: Optional[torch.Tensor]) -> bool:
+    for v in vals:
+        if v is None:
+            continue
+        if torch.is_tensor(v) and not bool(torch.isfinite(v).all()):
+            return False
+    return True
+
+
 def _save_loss_plot(history_df: pd.DataFrame, out_png: str) -> None:
     """
     Plot MIL losses and validation metrics in one figure.
@@ -605,6 +614,7 @@ def train_mil_supervised(
         ep_steps = 0
         ep_wh_steps = 0
         ep_se_steps = 0
+        ep_skipped_nonfinite = 0
 
         for batch in pbar:
             global_step += 1
@@ -660,6 +670,22 @@ def train_mil_supervised(
                 w_cons = mil_cfg.consistency_weight * ramp if (return_two_views and mil_cfg.use_mean_teacher) else 0.0
                 L = L_sup + w_cons * L_cons
 
+            if not _all_finite_tensors(yhat_wh_s, yhat_se_s, L_sup, L_cons, L):
+                ep_skipped_nonfinite += 1
+                if ep_skipped_nonfinite <= 3:
+                    print(
+                        "[WARN] Skip non-finite MIL batch: "
+                        f"epoch={epoch + 1}, step={global_step}, "
+                        f"L={float(L.detach().cpu())}, "
+                        f"L_sup={float(L_sup.detach().cpu())}, "
+                        f"L_cons={float(L_cons.detach().cpu())}"
+                    )
+                pbar.set_postfix(
+                    skip_nonfinite=int(ep_skipped_nonfinite),
+                    lr=float(opt.param_groups[0]["lr"]),
+                )
+                continue
+
             ep_steps += 1
             ep_total_sum += float(L.item())
             ep_sup_sum += float(L_sup.item())
@@ -690,7 +716,14 @@ def train_mil_supervised(
                 Lsup=float(L_sup.item()),
                 Lcons=float(L_cons.item()),
                 wcons=float(w_cons),
+                nan_skip=int(ep_skipped_nonfinite),
                 lr=float(opt.param_groups[0]["lr"]),
+            )
+
+        if ep_steps == 0:
+            raise RuntimeError(
+                "All MIL train batches were non-finite in this epoch. "
+                "Check data for NaN/Inf and hyperparameters (especially lr/amp)."
             )
 
         # Validation using teacher weights (EMA) for stability
@@ -705,6 +738,7 @@ def train_mil_supervised(
             "train_cons_weight": _safe_mean(ep_wcons_sum, ep_steps),
             "train_loss_wh": _safe_mean(ep_wh_sum, ep_wh_steps),
             "train_loss_se": _safe_mean(ep_se_sum, ep_se_steps),
+            "train_skipped_nonfinite": int(ep_skipped_nonfinite),
         }
         for k, v in val_metrics.items():
             if k == "val_score":

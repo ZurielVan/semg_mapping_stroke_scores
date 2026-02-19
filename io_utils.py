@@ -219,5 +219,4 @@ def load_emg_timeseries(
     else:
         # ambiguous, assume (C,T)
         emg = arr.astype(np.float32)
-
     return emg, None

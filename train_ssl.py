@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import math
 from dataclasses import dataclass, field, asdict, replace
 from typing import Optional
 
@@ -53,6 +54,16 @@ def _safe_mean(total: float, count: int) -> float:
     if count <= 0:
         return float("nan")
     return float(total / count)
+
+
+def _all_finite_stats(stats: dict) -> bool:
+    for v in stats.values():
+        try:
+            if not math.isfinite(float(v)):
+                return False
+        except Exception:
+            return False
+    return True
 
 
 def _save_ssl_loss_plot(history_df: pd.DataFrame, out_png: str) -> None:
@@ -181,6 +192,7 @@ def pretrain_ssl_moco(
         ep_pos_sum = 0.0
         ep_neg_sum = 0.0
         ep_steps = 0
+        ep_skipped_nonfinite = 0
         for x1, x2 in pbar:
             global_step += 1
             x1 = x1.to(device, non_blocking=True)
@@ -189,6 +201,21 @@ def pretrain_ssl_moco(
             opt.zero_grad(set_to_none=True)
             with autocast(enabled=scaler.is_enabled()):
                 loss, step_stats = ssl_model(x1, x2, return_stats=True)
+
+            if (not bool(torch.isfinite(loss).all())) or (not _all_finite_stats(step_stats)):
+                ep_skipped_nonfinite += 1
+                if ep_skipped_nonfinite <= 3:
+                    print(
+                        "[WARN] Skip non-finite SSL batch: "
+                        f"epoch={epoch + 1}, step={global_step}, "
+                        f"loss={float(loss.detach().cpu())}, stats={step_stats}"
+                    )
+                pbar.set_postfix(
+                    skip_nonfinite=int(ep_skipped_nonfinite),
+                    lr=float(opt.param_groups[0]["lr"]),
+                )
+                continue
+
             ep_steps += 1
             ep_loss_sum += float(loss.item())
             ep_moco_sum += float(step_stats["loss_moco"])
@@ -209,7 +236,14 @@ def pretrain_ssl_moco(
                 moco=float(step_stats["loss_moco"]),
                 recon=float(step_stats["loss_recon"]),
                 mask=float(step_stats["masked_fraction"]),
+                nan_skip=int(ep_skipped_nonfinite),
                 lr=float(opt.param_groups[0]["lr"]),
+            )
+
+        if ep_steps == 0:
+            raise RuntimeError(
+                "All SSL batches were non-finite in this epoch. "
+                "Check data for NaN/Inf and hyperparameters (especially lr/amp)."
             )
 
         loss_history_rows.append(
@@ -221,6 +255,7 @@ def pretrain_ssl_moco(
                 "ssl_masked_fraction": _safe_mean(ep_mask_ratio_sum, ep_steps),
                 "ssl_pos_sim": _safe_mean(ep_pos_sum, ep_steps),
                 "ssl_neg_sim": _safe_mean(ep_neg_sum, ep_steps),
+                "ssl_skipped_nonfinite": int(ep_skipped_nonfinite),
                 "lr_last": float(opt.param_groups[0]["lr"]),
                 "steps": int(ep_steps),
             }
