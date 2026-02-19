@@ -127,22 +127,23 @@ TEST_METRIC_KEYS = [
 
 PARAM_CANDIDATES: Dict[str, list[Any]] = {
     "emb_dim": [64, 128, 256],
-    "dropout": [0.05, 0.1, 0.2, 0.3],
+    "dropout": [0.05, 0.1, 0.2],
     "Tw_samples": [600],
     "overlap_ratio": [0.0, 0.25, 0.5],
     "windows_per_trial": [8, 16, 32],
     "trials_per_axis": [3],
-    "lr_head": [1e-2,1e-3],
-    "lr_encoder_scale": [0.1, 1.0],
-    "weight_decay": [1e-3],
+    # Keep MIL learning rates in a stable range across backbones.
+    "lr_head": [3e-5, 1e-4, 3e-4],
+    "lr_encoder_scale": [0.1, 0.3],
+    "weight_decay": [1e-4, 1e-3],
     "huber_delta": [0.04],
-    "lambda_ue": [0.0, 0.1, 0.2],
+    "lambda_ue": [0.0, 0.05, 0.1],
     "ema_decay": [0.99, 0.999],
-    "window_dropout_p": [0.0, 0.3],
-    "trial_dropout_p": [0.0, 0.3],
-    "consistency_weight": [0.0, 0.3],
-    "consistency_rampup_epochs": [0, 30],
-    "consistency_loss_type": ["mse"],
+    "window_dropout_p": [0.0, 0.1, 0.2],
+    "trial_dropout_p": [0.0, 0.05, 0.1],
+    "consistency_weight": [0.0, 0.05, 0.1],
+    "consistency_rampup_epochs": [0, 10, 30],
+    "consistency_loss_type": ["mse", "smoothl1"],
     "patch_size": [4, 8, 16],
     "layers": [2, 4, 6],
     "heads": [2, 4, 8],
@@ -732,6 +733,10 @@ def main():
                     expected_emg_ch=args.expected_emg_ch,
                 )
 
+                et_name = str(hps["encoder_type"]).strip().lower()
+                mil_use_amp = et_name not in {"rescnn", "mgcn"}
+                if not mil_use_amp:
+                    print(f"[INFO] Disable MIL AMP for encoder_type={et_name} (stability mode)")
                 mil_cfg = MILTrainConfig(
                     seed=args.seed + fold_id * 100 + t,
                     Tw_samples=hps["Tw_samples"],
@@ -752,6 +757,7 @@ def main():
                     dropout=hps["dropout"],
                     window_dropout_p=hps["window_dropout_p"],
                     trial_dropout_p=hps["trial_dropout_p"],
+                    use_amp=mil_use_amp,
                     use_mean_teacher=True,
                     consistency_weight=hps["consistency_weight"],
                     consistency_rampup_epochs=hps["consistency_rampup_epochs"],
