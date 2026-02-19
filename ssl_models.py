@@ -109,7 +109,11 @@ class MoCo(nn.Module):
             k = F.normalize(k, dim=1)
 
         l_pos = torch.einsum("bd,bd->b", [q, k]).unsqueeze(-1)
-        l_neg = torch.einsum("bd,dk->bk", [q, self.queue.detach()])
+        # Important: snapshot queue to avoid in-place version bumps before backward.
+        # We enqueue new keys in this same forward pass, so using self.queue directly
+        # can trigger: "variable needed for gradient computation has been modified..."
+        queue_snapshot = self.queue.detach().clone()
+        l_neg = torch.einsum("bd,dk->bk", [q, queue_snapshot])
         logits = torch.cat([l_pos, l_neg], dim=1) / self.cfg.temperature
         labels = torch.zeros(logits.size(0), dtype=torch.long, device=logits.device)
         loss = F.cross_entropy(logits, labels)
